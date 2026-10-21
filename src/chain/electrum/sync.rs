@@ -1,0 +1,889 @@
+//! A descriptor wallet read from an Electrum server, asking for no more
+//! than the wallet lacks.
+//!
+//! The history of a script is a list of txids and heights, a few dozen
+//! bytes each, and it is read for every script of the plan. What costs is
+//! what follows, and the engine of BDK asked for all of it at every sync:
+//! each transaction again, the transaction behind every coin each one
+//! spends, and a header and a merkle proof per confirmation. Here:
+//!
+//! - A transaction the wallet holds is not asked for again. One it lacks
+//!   is asked for once, and refused unless it hashes to its txid.
+//! - A confirmation the wallet holds is taken as proven when the server
+//!   puts the transaction at the same height and that block is still
+//!   the one the server has there: below the last block both chains
+//!   agree on, or among the latest blocks with the same hash. Anything
+//!   else, a new confirmation or one moved by a reorganisation, is
+//!   proven again, header and merkle branch.
+//! - The coins a transaction spends are asked for only for a
+//!   transaction the wallet lacked, and only those it cannot find in
+//!   what it holds: they are what its fee is counted from.
+//! - A history read on the server of a running live watch that does not
+//!   hash to the status that server announced for the script, and
+//!   leaves out a transaction the wallet holds there, is set aside
+//!   unread ([`super::status`]).
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use bdk_wallet::bitcoin::block::Header;
+use bdk_wallet::bitcoin::{BlockHash, ScriptBuf, Transaction, Txid};
+use bdk_wallet::chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
+use electrum_client::{self, ElectrumApi, GetHistoryRes};
+
+use super::status::{Check, Entry, Told, Verdict};
+use crate::chain::proof::chains_up_to;
+use crate::chain::proof::{
+    Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation, recheck,
+};
+use crate::chain::{
+    ANOTHER_NETWORK, BEHIND, Fault, Held, IMPOSSIBLE_TIP, Plan, Scan, Synced, TIP_LAG_MAX,
+    drops_a_confirmation, has_proof_of_work, height_limit,
+};
+use crate::network::Network;
+
+/// The fewest requests per batch while walking a keychain, before the
+/// cut to what completes the gap: see [`walk_batch`].
+const BATCH: usize = 10;
+/// Requests per batch for a list known in full: the scripts revealed,
+/// and the headers and proofs they call for. ElectrumX, from 1.18 on,
+/// holds small answers back until a kilobyte of them waits or a second
+/// has passed, so the end of every batch waits that second: ten at a
+/// time, a wallet of a hundred addresses took forty-five seconds to
+/// sync. No more than fifty: on a session it slows down, ElectrumX
+/// serves a few requests at a time, one every two seconds or so, and a
+/// request still waiting after thirty is an error that costs the session
+/// a hundred; a hundred in a batch would wait that long well before the
+/// session is cut for what it costs.
+const LIST_BATCH: usize = 50;
+/// The same for transactions, which Fulcrum reads from bitcoind: kept
+/// under [`FULCRUM_BITCOIND_BURST`].
+const TX_BATCH: usize = 40;
+/// Requests of one client waiting on bitcoind past which Fulcrum holds
+/// the client back for at least 200 ms (`bitcoind_throttle`, fifty by
+/// default).
+const FULCRUM_BITCOIND_BURST: usize = 50;
+const _: () = assert!(
+    TX_BATCH < FULCRUM_BITCOIND_BURST,
+    "a batch of transactions would hold the client back at Fulcrum"
+);
+/// The latest blocks read with the tip, as the engine of BDK reads them:
+/// a reorganisation that deep is met without a request per block.
+const CHAIN_SUFFIX: u32 = 8;
+
+type Error = electrum_client::Error;
+
+/// Runs a plan on an open connection.
+pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error> {
+    let Plan {
+        network,
+        tip,
+        start_time,
+        scripts,
+        scans,
+        stop_gap,
+        held,
+        told,
+        ..
+    } = plan;
+    let told = told.as_ref();
+    let confirmed: BTreeSet<u32> = held
+        .anchors
+        .values()
+        .map(|anchor| anchor.block_id.height)
+        .collect();
+    let mut chain = Chain::read(client, &tip, network, start_time, &confirmed)?;
+    let mut pass = Pass {
+        held: &held,
+        start_time,
+        update: TxUpdate::default(),
+        wanted: Vec::new(),
+        fetched: HashMap::new(),
+        to_prove: Vec::new(),
+        taken: HashSet::new(),
+        orders: Vec::new(),
+    };
+
+    let mut covered: HashSet<ScriptBuf> = scripts.iter().cloned().collect();
+    let mut set_aside = false;
+    for batch in scripts.chunks(LIST_BATCH) {
+        let histories = super::patiently(|| {
+            client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
+        })?;
+        for (script, history) in batch.iter().zip(histories) {
+            match stood_by(client, told, &held, script, history)? {
+                Some(history) => pass.take(script, &history, &chain),
+                None => set_aside = true,
+            }
+        }
+    }
+
+    let mut last_active = BTreeMap::new();
+    let gap = (stop_gap as usize).max(1);
+    for Scan { keychain, mut spks } in scans {
+        let mut unused = 0usize;
+        'scan: loop {
+            let batch: Vec<(u32, ScriptBuf)> = spks
+                .by_ref()
+                .take(walk_batch(stop_gap, gap - unused))
+                .collect();
+            if batch.is_empty() {
+                break;
+            }
+            let histories = super::patiently(|| {
+                client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))
+            })?;
+            for ((index, script), history) in batch.iter().zip(histories) {
+                // Set aside, it holds something the wallet holds: it is
+                // used, the scan goes on past it, and the wallet reveals
+                // it.
+                let Some(history) = stood_by(client, told, &held, script, history)? else {
+                    covered.insert(script.clone());
+                    set_aside = true;
+                    unused = 0;
+                    last_active.insert(keychain, *index);
+                    continue;
+                };
+                if history.is_empty() {
+                    unused = unused.saturating_add(1);
+                    if unused >= gap {
+                        break 'scan;
+                    }
+                } else {
+                    unused = 0;
+                    last_active.insert(keychain, *index);
+                }
+                pass.take(script, &history, &chain);
+                covered.insert(script.clone());
+            }
+        }
+    }
+
+    // The scripts of the confirmations a reorganisation moved, read
+    // whatever the plan: see [`Held::reorganised`].
+    let moved = held.reorganised(chain.agreement, &covered);
+    for batch in moved.chunks(LIST_BATCH) {
+        let histories = super::patiently(|| {
+            client.batch_script_get_history(batch.iter().map(|s| s.as_script()))
+        })?;
+        for (script, history) in batch.iter().zip(histories) {
+            match stood_by(client, told, &held, script, history)? {
+                Some(history) => pass.take(script, &history, &chain),
+                None => set_aside = true,
+            }
+        }
+    }
+
+    pass.fetch_missing(client)?;
+    pass.prove(client, network, &mut chain)?;
+    pass.fetch_prevouts(client)?;
+    let tip = chain.update(&pass.update);
+    Ok(Synced {
+        update: bdk_wallet::Update {
+            last_active_indices: last_active,
+            tx_update: pass.update,
+            chain: Some(tip),
+        },
+        orders: pass.orders,
+        drop_above: chain.dropped,
+        set_aside,
+    })
+}
+
+/// Requests per batch while walking a keychain: as many as the gap, so
+/// that a walk that finds nothing past the last address used reads that
+/// gap in one batch, as ElectrumX, which waits a second at the end of
+/// each, would have it, within [`BATCH`] and [`LIST_BATCH`]. Then cut to
+/// the `missing` unused addresses that would complete the gap: every
+/// script asked for is an address the server learns before it is used,
+/// and the gap is how many the user lets it learn past the last one
+/// used. A used address at the head of a batch costs one batch more.
+fn walk_batch(stop_gap: u32, missing: usize) -> usize {
+    usize::try_from(stop_gap)
+        .unwrap_or(usize::MAX)
+        .clamp(BATCH, LIST_BATCH)
+        .min(missing)
+}
+
+/// The history of `script` the server listed, when the sync reads it:
+/// no status was heard from the server for the script, or the history
+/// stands up to it ([`verdict`]). `None` when it is set aside. The
+/// server is asked for it once more at most.
+fn stood_by(
+    client: &impl ElectrumApi,
+    told: Option<&Told>,
+    held: &Held,
+    script: &ScriptBuf,
+    history: Vec<GetHistoryRes>,
+) -> Result<Option<Vec<GetHistoryRes>>, Error> {
+    let none = HashSet::new();
+    let expected = held
+        .scripts
+        .get(script)
+        .map_or(&none, |facts| &facts.expected);
+    let mut check = Check::new(told, script, expected);
+    let mut history = history;
+    loop {
+        let listed: Vec<Entry> = history
+            .iter()
+            .map(|entry| (entry.tx_hash, entry.height))
+            .collect();
+        match check.verdict(Some(&listed)) {
+            Verdict::Read => return Ok(Some(history)),
+            Verdict::SetAside => return Ok(None),
+            Verdict::AskAgain => history = client.script_get_history(script)?,
+        }
+    }
+}
+
+/// The server's chain against the wallet's.
+struct Chain {
+    /// The wallet's chain up to the last block both agree on, then the
+    /// server's latest blocks.
+    tip: CheckPoint,
+    /// The server's hash at each height read: the latest blocks, and the
+    /// ones read on the way down to the agreement.
+    hashes: BTreeMap<u32, BlockHash>,
+    /// Headers read, by height.
+    headers: HashMap<u32, Header>,
+    /// The height of the last block both chains agree on.
+    agreement: u32,
+    /// The wallet's blocks above this height are no chain's, and the
+    /// chain of the update was built without them: see
+    /// [`Synced::drop_above`].
+    dropped: Option<u32>,
+    /// The tip the server announced: no confirmation sits above it but
+    /// for blocks that came in since ([`above_the_tip`]).
+    server_tip: u32,
+}
+
+impl Chain {
+    /// The tip and the latest blocks, then the wallet's chain walked down
+    /// to a block the server has too. A server behind the wallet leaves
+    /// the wallet's chain as it is, once it is found on it all the same:
+    /// a server whose chain never meets the wallet's, one of another
+    /// network, is refused rather than read, or every transaction the
+    /// wallet holds would look gone from the chain.
+    ///
+    /// The tip is a claim, refused past any height a chain of the
+    /// network can have reached ([`height_limit`]), and the latest
+    /// blocks under it are checked ([`checked_suffix`]). The wallet's
+    /// own blocks are read the same way: those far above the server's
+    /// tip, or past that height, came from a server that made them up.
+    /// They are left out of the walk, and dropped, unless one of them
+    /// holds a confirmation ([`drops_a_confirmation`]).
+    ///
+    /// A block of the wallet that holds a confirmation, in `confirmed`,
+    /// and that the server replaces below its latest blocks, is replaced
+    /// on proof alone ([`prove_below_the_latest`]).
+    fn read(
+        client: &impl ElectrumApi,
+        local: &CheckPoint,
+        network: Network,
+        now: u64,
+        confirmed: &BTreeSet<u32>,
+    ) -> Result<Self, Error> {
+        let limit = height_limit(network, now);
+        let notification = client.block_headers_subscribe()?;
+        let height = u32::try_from(notification.height)
+            .ok()
+            .filter(|height| *height <= limit)
+            .ok_or_else(|| Error::Message(IMPOSSIBLE_TIP.to_owned()))?;
+        let (local, dropped) =
+            if local.height() > height.saturating_add(TIP_LAG_MAX) || local.height() > limit {
+                if drops_a_confirmation(network, confirmed.iter().copied(), height, limit) {
+                    return Err(Error::Message(BEHIND.to_owned()));
+                }
+                let kept = local
+                    .iter()
+                    .find(|checkpoint| checkpoint.height() <= height)
+                    .unwrap_or_else(|| local.clone());
+                (kept, Some(height))
+            } else {
+                (local.clone(), None)
+            };
+        let mut network_checked = false;
+        if height < local.height() {
+            let mut hashes = BTreeMap::new();
+            let mut headers = HashMap::new();
+            for checkpoint in local
+                .iter()
+                .filter(|checkpoint| checkpoint.height() <= height)
+            {
+                let at = checkpoint.height();
+                let header = client.block_header(at as usize)?;
+                let hash = header.block_hash();
+                hashes.insert(at, hash);
+                headers.insert(at, header);
+                if hash == checkpoint.hash() {
+                    return Ok(Chain {
+                        tip: local.clone(),
+                        hashes,
+                        headers,
+                        agreement: at,
+                        dropped,
+                        server_tip: height,
+                    });
+                }
+                same_network(client, &local, &mut network_checked)?;
+            }
+            return Err(Error::Message(
+                "the server's chain never meets the wallet's".to_owned(),
+            ));
+        }
+        let start = height.saturating_sub(CHAIN_SUFFIX - 1);
+        let latest = client.block_headers(start as usize, CHAIN_SUFFIX as usize)?;
+        let latest = checked_suffix(network, start, height, &notification.header, latest.headers)?;
+        let mut headers = HashMap::new();
+        let mut hashes = BTreeMap::new();
+        for (at, header) in (start..).zip(latest) {
+            hashes.insert(at, header.block_hash());
+            headers.insert(at, header);
+        }
+        let mut agreement = None;
+        for checkpoint in local.iter() {
+            let at = checkpoint.height();
+            let hash = match hashes.get(&at) {
+                Some(hash) => *hash,
+                None => {
+                    let header = client.block_header(at as usize)?;
+                    let hash = header.block_hash();
+                    hashes.insert(at, hash);
+                    headers.insert(at, header);
+                    hash
+                }
+            };
+            if hash == checkpoint.hash() {
+                agreement = Some(checkpoint);
+                break;
+            }
+            same_network(client, &local, &mut network_checked)?;
+        }
+        let agreement = agreement.ok_or_else(|| {
+            Error::Message("the server's chain never meets the wallet's".to_owned())
+        })?;
+        // Every block of the wallet above the agreement is one the server
+        // replaces; the lowest of those below the latest blocks that
+        // holds a confirmation.
+        let replaced = local
+            .iter()
+            .map(|checkpoint| checkpoint.height())
+            .take_while(|at| *at > agreement.height())
+            .filter(|at| *at < start && confirmed.contains(at))
+            .last();
+        if let Some(from) = replaced {
+            prove_below_the_latest(client, network, from, start, &hashes)?;
+        }
+        let tip = agreement
+            .clone()
+            .extend(
+                hashes
+                    .range(agreement.height() + 1..)
+                    .map(|(&height, &hash)| BlockId { height, hash }),
+            )
+            .map_err(|_| {
+                Error::Message("the server's chain never meets the wallet's".to_owned())
+            })?;
+        Ok(Chain {
+            tip,
+            hashes,
+            headers,
+            agreement: agreement.height(),
+            dropped,
+            server_tip: height,
+        })
+    }
+
+    /// Whether a confirmation the wallet holds still stands where the
+    /// server puts the transaction.
+    fn still_holds(&self, anchor: &ConfirmationBlockTime, height: u32) -> bool {
+        if anchor.block_id.height != height {
+            return false;
+        }
+        match self.hashes.get(&height) {
+            Some(hash) => *hash == anchor.block_id.hash,
+            None => height <= self.agreement,
+        }
+    }
+
+    /// The chain of the update: a block per height a transaction
+    /// confirmed at, below the tip, as the engine of BDK builds it.
+    fn update(&self, update: &TxUpdate<ConfirmationBlockTime>) -> CheckPoint {
+        let mut tip = self.tip.clone();
+        for (anchor, _) in &update.anchors {
+            let height = anchor.block_id.height;
+            if tip.get(height).is_none() && height <= tip.height() {
+                let hash = self
+                    .hashes
+                    .get(&height)
+                    .copied()
+                    .unwrap_or(anchor.block_id.hash);
+                tip = tip.insert(BlockId { height, hash });
+            }
+        }
+        tip
+    }
+}
+
+/// The latest headers a server sent, from `start` up to its tip at
+/// `height`, checked: one for each height, the extra ones dropped, each
+/// the parent of the next, the last one the tip the server announced,
+/// and each with the work its network asks for ([`has_proof_of_work`]).
+/// They go into the wallet's chain as they are: a server that sends
+/// fewer, or headers that do not chain to its tip, is refused.
+fn checked_suffix(
+    network: Network,
+    start: u32,
+    height: u32,
+    tip: &Header,
+    mut headers: Vec<Header>,
+) -> Result<Vec<Header>, Error> {
+    let wanted = height.saturating_sub(start) as usize + 1;
+    if headers.len() >= wanted {
+        headers.truncate(wanted);
+        let chained = headers
+            .windows(2)
+            .all(|pair| pair[1].prev_blockhash == pair[0].block_hash());
+        let at_tip = headers
+            .last()
+            .is_some_and(|last| last.block_hash() == tip.block_hash());
+        let worked = (start..)
+            .zip(&headers)
+            .all(|(at, header)| has_proof_of_work(network, at, header));
+        if chained && at_tip && worked {
+            return Ok(headers);
+        }
+    }
+    Err(Error::Message(
+        "the server's latest blocks do not chain".to_owned(),
+    ))
+}
+
+/// Proves the server's blocks from `from` up to `start`, the first of
+/// its latest blocks, checked already: a reorganisation that takes back
+/// a confirmation the wallet proved at `from` ([`chains_up_to`]). The
+/// hashes read on the way down must be those of the chain. Refused as
+/// [`Fault::unproven_reorganisation`] otherwise, the server's refusal
+/// to send the headers included.
+fn prove_below_the_latest(
+    client: &impl ElectrumApi,
+    network: Network,
+    from: u32,
+    start: u32,
+    hashes: &BTreeMap<u32, BlockHash>,
+) -> Result<(), Error> {
+    let unproven = || super::raised(Fault::unproven_reorganisation());
+    let top = *hashes.get(&start).ok_or_else(unproven)?;
+    let headers = headers_from(client, from, start - from + 1)?.ok_or_else(unproven)?;
+    if headers.len() as u32 != start - from + 1 || !chains_up_to(network, from, &headers, top) {
+        return Err(unproven());
+    }
+    let agrees = (from..).zip(&headers).all(|(at, header)| {
+        hashes
+            .get(&at)
+            .is_none_or(|read| *read == header.block_hash())
+    });
+    if !agrees {
+        return Err(unproven());
+    }
+    Ok(())
+}
+
+/// Refuses a server of another network, once its chain and the
+/// wallet's have disagreed on a block: their genesis blocks differ, and
+/// walking down to it would take a request for every block the wallet
+/// holds. Asked once a walk.
+fn same_network(
+    client: &impl ElectrumApi,
+    local: &CheckPoint,
+    checked: &mut bool,
+) -> Result<(), Error> {
+    if std::mem::replace(checked, true) {
+        return Ok(());
+    }
+    let ours = local.iter().last().map(|genesis| genesis.hash());
+    if Some(client.block_header(0)?.block_hash()) != ours {
+        return Err(Error::Message(ANOTHER_NETWORK.to_owned()));
+    }
+    Ok(())
+}
+
+/// The update being put together.
+struct Pass<'h> {
+    held: &'h Held,
+    start_time: u64,
+    update: TxUpdate<ConfirmationBlockTime>,
+    /// Transactions the wallet lacks, in the order they were met.
+    wanted: Vec<Txid>,
+    fetched: HashMap<Txid, Arc<Transaction>>,
+    /// Confirmations to prove: txid and height.
+    to_prove: Vec<(Txid, u32)>,
+    /// Transactions already taken from another script.
+    taken: HashSet<Txid>,
+    /// Each history as the server listed it.
+    orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
+}
+
+impl Pass<'_> {
+    /// Takes the history of one script.
+    fn take(&mut self, script: &ScriptBuf, history: &[GetHistoryRes], chain: &Chain) {
+        self.orders.push((
+            script.clone(),
+            history
+                .iter()
+                .map(|entry| (entry.tx_hash, entry.height))
+                .collect(),
+        ));
+        if let Some(facts) = self.held.scripts.get(script) {
+            let listed: HashSet<Txid> = history.iter().map(|entry| entry.tx_hash).collect();
+            self.update.evicted_ats.extend(
+                facts
+                    .expected
+                    .iter()
+                    .filter(|txid| !listed.contains(*txid))
+                    .map(|txid| (*txid, self.start_time)),
+            );
+        }
+        for entry in history {
+            let txid = entry.tx_hash;
+            if !self.taken.insert(txid) {
+                continue;
+            }
+            if !self.held.txs.contains_key(&txid) {
+                self.wanted.push(txid);
+            }
+            match u32::try_from(entry.height) {
+                // 0 and -1 are the mempool.
+                Ok(height) if height > 0 => match self.held.anchors.get(&txid) {
+                    Some(anchor) if chain.still_holds(anchor, height) => {}
+                    _ => self.to_prove.push((txid, height)),
+                },
+                _ => {
+                    self.update.seen_ats.insert((txid, self.start_time));
+                }
+            }
+        }
+    }
+
+    /// Asks for the transactions the wallet lacks.
+    fn fetch_missing(&mut self, client: &impl ElectrumApi) -> Result<(), Error> {
+        let wanted = std::mem::take(&mut self.wanted);
+        for (txid, tx) in fetch_txs(client, &wanted)? {
+            self.update.txs.push(tx.clone());
+            self.fetched.insert(txid, tx);
+        }
+        Ok(())
+    }
+
+    /// Proves the confirmations the wallet does not hold: the header of
+    /// each block, then the merkle branch of each transaction in it,
+    /// each held to [`check_confirmation`]. A proof that does not hold
+    /// refuses the server ([`crate::chain::proof::FALSE_PROOF`]): it named a confirmation it
+    /// cannot back, and the next server is asked instead of this one
+    /// being believed on anything else. One that is unsure leaves the
+    /// transaction unconfirmed, as seen in the mempool now: among them, a
+    /// branch or a header the server refused, one into a block that
+    /// replaced the one read ([`recheck`]), one in a block that came in
+    /// since the tip was read ([`above_the_tip`]), and an early one whose
+    /// chain to its checkpoint the server would not send. That chain is
+    /// read last, a period at a time ([`chains_to_read`]): one that does
+    /// not end at the checkpoint, or holds another block, refuses the
+    /// server.
+    fn prove(
+        &mut self,
+        client: &impl ElectrumApi,
+        network: Network,
+        chain: &mut Chain,
+    ) -> Result<(), Error> {
+        let false_proof = || super::raised(Fault::false_proof());
+        let mut to_prove = std::mem::take(&mut self.to_prove);
+        // A long sync may have seen blocks come in since the tip was
+        // read: the tip is read again before anything is refused for it.
+        if to_prove
+            .iter()
+            .any(|(_, height)| above_the_tip(*height, chain.server_tip) == Some(Proof::False))
+        {
+            let again = client.block_headers_subscribe()?;
+            if let Ok(height) = u32::try_from(again.height)
+                && height <= height_limit(network, self.start_time)
+            {
+                chain.server_tip = chain.server_tip.max(height);
+            }
+        }
+        for (txid, height) in &to_prove {
+            match above_the_tip(*height, chain.server_tip) {
+                Some(Proof::False) => return Err(false_proof()),
+                Some(_) => {
+                    self.update.seen_ats.insert((*txid, self.start_time));
+                }
+                None => {}
+            }
+        }
+        to_prove.retain(|(_, height)| *height <= chain.server_tip);
+        let mut missing: Vec<u32> = to_prove
+            .iter()
+            .map(|(_, height)| *height)
+            .filter(|height| !chain.headers.contains_key(height))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        for heights in missing.chunks(LIST_BATCH) {
+            match client.batch_block_header(heights.iter().copied()) {
+                Ok(headers) if headers.len() == heights.len() => {
+                    for (height, header) in heights.iter().zip(headers) {
+                        chain.headers.insert(*height, header);
+                    }
+                }
+                Ok(_) => return Err(false_proof()),
+                // Refused, as for a block a reorganisation took: each is
+                // asked alone, and one still refused leaves what it would
+                // prove unsure.
+                Err(error) if refused(&error) => {
+                    for height in heights {
+                        match client.block_header(*height as usize) {
+                            Ok(header) => {
+                                chain.headers.insert(*height, header);
+                            }
+                            Err(error) if refused(&error) => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut proven: Vec<(Txid, u32, Header)> = Vec::new();
+        for batch in to_prove.chunks(LIST_BATCH) {
+            for ((txid, height), proof) in batch.iter().zip(branches(client, batch)?) {
+                let Some(header) = chain.headers.get(height).copied() else {
+                    self.update.seen_ats.insert((*txid, self.start_time));
+                    continue;
+                };
+                let verdict = match &proof {
+                    None => Proof::Unsure,
+                    Some(proof) => {
+                        match check_confirmation(network, *height, &header, *txid, proof) {
+                            Proof::Elsewhere => match client.block_header(*height as usize) {
+                                Ok(again) => {
+                                    recheck(network, *height, &header, &again, *txid, proof)
+                                }
+                                Err(error) if refused(&error) => Proof::Unsure,
+                                Err(error) => return Err(error),
+                            },
+                            verdict => verdict,
+                        }
+                    }
+                };
+                match verdict {
+                    Proof::Holds => proven.push((*txid, *height, header)),
+                    Proof::Unsure => {
+                        self.update.seen_ats.insert((*txid, self.start_time));
+                    }
+                    Proof::False | Proof::Elsewhere => return Err(false_proof()),
+                }
+            }
+        }
+
+        // Then the chains to the checkpoints the early ones need.
+        let blocks: Vec<(u32, BlockHash)> = proven
+            .iter()
+            .map(|(_, height, header)| (*height, header.block_hash()))
+            .collect();
+        let mut read = HashMap::new();
+        for (from, count) in chains_to_read(network, &blocks) {
+            let Some(headers) = headers_from(client, from, count)? else {
+                continue;
+            };
+            let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(false_proof)?;
+            read.insert(from, hashes);
+        }
+        for (txid, height, header) in proven {
+            match chained(network, height, header.block_hash(), &read) {
+                Proof::Holds => {}
+                Proof::Unsure => {
+                    self.update.seen_ats.insert((txid, self.start_time));
+                    continue;
+                }
+                Proof::False | Proof::Elsewhere => return Err(false_proof()),
+            }
+            self.update.anchors.insert((
+                ConfirmationBlockTime {
+                    block_id: BlockId {
+                        height,
+                        hash: header.block_hash(),
+                    },
+                    confirmation_time: u64::from(header.time),
+                },
+                txid,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Asks for the coins the new transactions spend that the wallet
+    /// cannot find in what it holds.
+    fn fetch_prevouts(&mut self, client: &impl ElectrumApi) -> Result<(), Error> {
+        let mut spent = Vec::new();
+        let mut wanted = Vec::new();
+        let mut asked = HashSet::new();
+        for tx in self.fetched.values() {
+            if tx.is_coinbase() {
+                continue;
+            }
+            for input in &tx.input {
+                let outpoint = input.previous_output;
+                if self.held.txs.contains_key(&outpoint.txid)
+                    || self.fetched.contains_key(&outpoint.txid)
+                    || self.held.txouts.contains(&outpoint)
+                {
+                    continue;
+                }
+                spent.push(outpoint);
+                if asked.insert(outpoint.txid) {
+                    wanted.push(outpoint.txid);
+                }
+            }
+        }
+        let previous = fetch_txs(client, &wanted)?;
+        for outpoint in spent {
+            let txout = previous
+                .get(&outpoint.txid)
+                .and_then(|tx| tx.output.get(outpoint.vout as usize))
+                .ok_or_else(|| Error::Message(format!("the coin {outpoint} does not exist")))?;
+            self.update.txouts.insert(outpoint, txout.clone());
+        }
+        Ok(())
+    }
+}
+
+/// The merkle branches of a batch of confirmations, in its order: `None`
+/// for one the server refused, as it does when a block came in since it
+/// listed the history and the transaction is no longer where it said.
+/// The batch is asked as one; refused, each is asked alone.
+fn branches(
+    client: &impl ElectrumApi,
+    batch: &[(Txid, u32)],
+) -> Result<Vec<Option<electrum_client::GetMerkleRes>>, Error> {
+    let asked = batch.iter().map(|(txid, height)| (*txid, *height as usize));
+    match client.batch_transaction_get_merkle(asked) {
+        Ok(proofs) if proofs.len() == batch.len() => Ok(proofs.into_iter().map(Some).collect()),
+        Ok(_) => Err(super::raised(Fault::false_proof())),
+        Err(error) if refused(&error) => batch
+            .iter()
+            .map(
+                |(txid, height)| match client.transaction_get_merkle(txid, *height as usize) {
+                    Ok(proof) => Ok(Some(proof)),
+                    Err(error) if refused(&error) => Ok(None),
+                    Err(error) => Err(error),
+                },
+            )
+            .collect(),
+        Err(error) => Err(error),
+    }
+}
+
+/// The `count` headers from `from`, asked as many times as the server's
+/// own limit takes; `None` when it refuses them.
+pub(crate) fn headers_from(
+    client: &impl ElectrumApi,
+    from: u32,
+    count: u32,
+) -> Result<Option<Vec<Header>>, Error> {
+    let mut headers: Vec<Header> = Vec::with_capacity(count as usize);
+    while (headers.len() as u32) < count {
+        let next = from + headers.len() as u32;
+        let left = count - headers.len() as u32;
+        match client.block_headers(next as usize, left as usize) {
+            Ok(answer) if !answer.headers.is_empty() => headers.extend(answer.headers),
+            Ok(_) => break,
+            Err(error) if refused(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    headers.truncate(count as usize);
+    Ok(Some(headers))
+}
+
+/// Whether the server answered with an error of its own, rather than
+/// failing to answer at all.
+fn refused(error: &Error) -> bool {
+    match error {
+        Error::Protocol(_) => true,
+        Error::AllAttemptsErrored(errors) => errors.last().is_some_and(refused),
+        _ => false,
+    }
+}
+
+/// Asks for transactions by txid, a batch at a time, and refuses one
+/// that does not hash to the txid it was asked for.
+fn fetch_txs(
+    client: &impl ElectrumApi,
+    txids: &[Txid],
+) -> Result<HashMap<Txid, Arc<Transaction>>, Error> {
+    let mut found = HashMap::new();
+    for batch in txids.chunks(TX_BATCH) {
+        let txs = super::patiently(|| client.batch_transaction_get(batch.iter()))?;
+        for (txid, tx) in batch.iter().zip(txs) {
+            if tx.compute_txid() != *txid {
+                return Err(Error::Message(
+                    "the server answered with another transaction than the one asked for"
+                        .to_owned(),
+                ));
+            }
+            found.insert(*txid, Arc::new(tx));
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::bitcoin::block::{Header, Version};
+    use bdk_wallet::bitcoin::hashes::Hash;
+    use bdk_wallet::bitcoin::{CompactTarget, TxMerkleNode};
+
+    use super::*;
+
+    /// Headers on top of one another, from a parent of none.
+    fn headers(count: u32) -> Vec<Header> {
+        let mut chain: Vec<Header> = Vec::new();
+        for at in 0..count {
+            chain.push(Header {
+                version: Version::TWO,
+                prev_blockhash: chain
+                    .last()
+                    .map_or_else(BlockHash::all_zeros, Header::block_hash),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1_700_000_000 + at,
+                bits: CompactTarget::from_consensus(0x1e03_77ae),
+                nonce: 0,
+            });
+        }
+        chain
+    }
+
+    /// The latest headers are taken only as a chain that ends at the tip
+    /// the server announced; extra ones are dropped, and missing ones,
+    /// one that does not follow the one before, or a tip of another
+    /// chain, refuse the server.
+    #[test]
+    fn the_latest_headers_must_chain_to_the_tip() {
+        let chain = headers(8);
+        let tip = chain[7];
+        let suffix = checked_suffix(Network::Signet, 92, 99, &tip, chain.clone()).unwrap();
+        assert_eq!(suffix.len(), 8);
+        let mut longer = chain.clone();
+        longer.extend(headers(3));
+        assert_eq!(
+            checked_suffix(Network::Signet, 92, 99, &tip, longer).unwrap(),
+            chain
+        );
+        assert!(checked_suffix(Network::Signet, 92, 99, &tip, chain[..7].to_vec()).is_err());
+        let mut broken = chain.clone();
+        broken[4].prev_blockhash = BlockHash::all_zeros();
+        assert!(checked_suffix(Network::Signet, 92, 99, &tip, broken).is_err());
+        assert!(checked_suffix(Network::Signet, 92, 99, &chain[6], chain.clone()).is_err());
+        // On mainnet, none of them was mined.
+        assert!(checked_suffix(Network::Mainnet, 92, 99, &tip, chain).is_err());
+    }
+}

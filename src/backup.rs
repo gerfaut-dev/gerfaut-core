@@ -1,0 +1,907 @@
+//! Encrypted backup of the wallets: the file a user keeps somewhere
+//! safe, and the animated QR that carries the same bytes from one
+//! device to the other.
+//!
+//! A backup holds wallet identities (descriptors or addresses, names,
+//! labels) and, on request, the settings worth carrying over: backends,
+//! accepted Electrum certificates, gap limit. Never chain state: the
+//! receiving device syncs on its own. The payload is JSON, compressed,
+//! then sealed with the vault cipher under a password-derived key and a
+//! magic of its own ([`BACKUP_MAGIC`]), so a backup and a vault can never
+//! be mistaken for one another. A backup only ever carries what the
+//! vault does, and the vault never holds a private key.
+//!
+//! Over QR the sealed bytes ride in `ur:bytes` frames (BCR-2020-005),
+//! the envelope the scanners around already speak. The frame list loops
+//! on screen, and a receiver may join at any frame.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+
+use ciborium::Value;
+use serde::{Deserialize, Serialize};
+
+use crate::chain::BackendConfig;
+use crate::error::{CoreError, CoreResult, VaultError};
+use crate::network::Network;
+use crate::store::VaultKey;
+use crate::store::cipher::{self, BACKUP_MAGIC};
+use crate::wallet::meta::{WalletKind, WalletMeta};
+
+/// Payload schema version written by this build.
+pub const BACKUP_VERSION: u32 = 1;
+
+/// Prefix of a backup in text form: what a scanned QR yields, and one
+/// of the forms the restore screen accepts.
+pub const BACKUP_PREFIX: &str = "gerfaut-backup:";
+
+/// Largest text a backup may arrive as, base64 included: 8 MiB, which
+/// is orders of magnitude past any real wallet list.
+pub const MAX_BACKUP_TEXT: usize = 8 * 1024 * 1024;
+
+/// Largest payload a backup may decompress to. Zlib reaches a thousand
+/// to one: without a bound, a crafted file inflates until the device
+/// gives up. A hundred wallets fit in a fraction of this.
+pub const MAX_BACKUP_PAYLOAD: usize = 16 * 1024 * 1024;
+
+/// Shortest accepted password, after trimming.
+const MIN_PASSWORD_CHARS: usize = 8;
+
+/// Longest fragment of an animated QR, in bytes. The trade-off is
+/// density against readability: a denser frame means fewer frames and
+/// a shorter loop, a sparser one is caught more surely by a phone
+/// camera at arm's length. A 160-byte fragment makes a `ur:bytes` frame
+/// of about 370 characters, a version-12 code at medium error
+/// correction; at 100 bytes a backup of ten wallets ran to dozens of
+/// frames, each shown for 200 ms, and a scan took several turns of the
+/// loop more often than one.
+const MAX_FRAGMENT_LEN: usize = 160;
+
+/// One wallet as a backup carries it: identity and labels, no chain
+/// state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupWallet {
+    pub name: String,
+    pub network: Network,
+    pub kind: WalletKind,
+    /// The gap limit when the backup was written. Kept for the format:
+    /// every build so far requires it. A restore ignores it, since the
+    /// gap limit is one setting shared by every wallet: the backup's
+    /// when its settings are applied, this device's otherwise.
+    pub gap_limit: u32,
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// When the wallet was added, unix seconds. Kept for the format, as
+    /// above: a restored wallet is dated by its restore.
+    pub created_at: u64,
+    /// Watched live before any other wallet: see
+    /// [`WalletMeta::live_pinned`]. Left out while off, so a backup
+    /// with no wallet pinned reads as one written before pinning.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_pinned: bool,
+}
+
+/// Everything a backup decrypts to. The settings fields are present
+/// only when the export included them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BackupPayload {
+    pub version: u32,
+    pub created_at: u64,
+    pub wallets: Vec<BackupWallet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backends: Option<BTreeMap<Network, BackendConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub electrum_certs: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_limit: Option<u32>,
+}
+
+impl BackupPayload {
+    /// True when the export carried settings.
+    pub fn has_settings(&self) -> bool {
+        self.backends.is_some() || self.electrum_certs.is_some() || self.gap_limit.is_some()
+    }
+}
+
+/// What to put in a backup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BackupOptions {
+    /// Wallets to include; `None` means every wallet on every network.
+    #[serde(default)]
+    pub wallet_ids: Option<Vec<String>>,
+    /// Whether backends, accepted certificates and the gap limit ride
+    /// along.
+    #[serde(default)]
+    pub include_settings: bool,
+}
+
+/// A sealed backup in both transport forms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupBundle {
+    /// The sealed file bytes, base64.
+    pub data: String,
+    /// The frames of the animated QR, to loop on screen.
+    pub frames: Vec<String>,
+    pub wallet_count: u32,
+    pub size_bytes: u32,
+}
+
+/// What a backup holds, before anything is restored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupPreview {
+    pub created_at: u64,
+    pub wallets: Vec<BackupWalletPreview>,
+    pub has_settings: bool,
+    /// The backends the settings would put in place, one per network,
+    /// named the way a sync report names them. What "apply node
+    /// settings" agrees to is spelled out here, not summed up as a
+    /// flag. Empty when the backup carries no settings.
+    #[serde(default)]
+    pub backends: Vec<BackupBackendPreview>,
+    /// The `host:port` of every Electrum certificate the settings would
+    /// accept, the ones a restore would pin: a host this vault pins
+    /// already keeps its own pin and is not listed, nor one the backup
+    /// gives two fingerprints for. Empty when the backup carries no
+    /// settings.
+    #[serde(default)]
+    pub electrum_hosts: Vec<String>,
+}
+
+/// One backend a backup would put in place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupBackendPreview {
+    pub network: Network,
+    /// The host, as [`BackendConfig::label`] names it: never a full
+    /// URL, which may carry credentials.
+    pub backend: String,
+}
+
+/// One wallet of a backup, as the restore screen lists it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupWalletPreview {
+    /// Position in the backup, the handle [`ImportChoices`] uses.
+    pub index: u32,
+    pub name: String,
+    pub network: Network,
+    pub kind: WalletKind,
+    /// A wallet watching the same thing on the same network exists
+    /// already, or comes back with a wallet before it in the same
+    /// backup; restoring it would be skipped.
+    pub already_watched: bool,
+    /// Why a restore cannot take this wallet, in the core's words: its
+    /// material does not read as a wallet to watch, or its two
+    /// descriptors are not one wallet. A restore of every wallet leaves
+    /// it out and names it ([`ImportReport::refused`]); one that asks for
+    /// it by index fails, and names it. `None` for a wallet a restore
+    /// takes, and for one already watched, which a restore skips anyway.
+    #[serde(default)]
+    pub refused: Option<String>,
+}
+
+/// What to restore out of a backup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportChoices {
+    /// Wallets to restore, by index in the preview; `None` means all.
+    #[serde(default)]
+    pub indexes: Option<Vec<u32>>,
+    /// Whether the settings the backup carries replace the current ones.
+    #[serde(default)]
+    pub apply_settings: bool,
+}
+
+/// Outcome of a restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportReport {
+    pub added: Vec<WalletMeta>,
+    /// Wallets left out: not chosen, or already watched.
+    pub skipped: u32,
+    pub settings_applied: bool,
+    /// Wallets a restore of every wallet left out because it cannot
+    /// watch them, as the preview marked them: not in `skipped`.
+    #[serde(default)]
+    pub refused: Vec<RefusedWallet>,
+}
+
+/// A wallet of a backup a restore left out because it cannot watch it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedWallet {
+    /// Its position in the backup, as in the preview.
+    pub index: u32,
+    pub name: String,
+    /// Why, in the core's words.
+    pub reason: String,
+}
+
+/// The refusal of what cannot be read as a backup, whatever it turns
+/// out to be. Never a password's fault: that one is
+/// [`VaultError::WrongKeyOrCorrupted`], and the screens say "wrong
+/// password" for it and for nothing else.
+fn unreadable(detail: impl Into<String>) -> CoreError {
+    CoreError::UnreadableBackup(detail.into())
+}
+
+/// The key a password derives to. Trimmed, on both sides: a stray
+/// space typed on one device must not lock the other one out.
+fn password_key(password: &str) -> VaultKey {
+    VaultKey::Password(password.trim().to_owned())
+}
+
+/// The key a new backup is sealed under: one of at least
+/// [`MIN_PASSWORD_CHARS`], once trimmed.
+fn sealing_key(password: &str) -> CoreResult<VaultKey> {
+    if password.trim().chars().count() < MIN_PASSWORD_CHARS {
+        return Err(CoreError::InvalidInput {
+            kind: "backup password",
+            detail: format!("at least {MIN_PASSWORD_CHARS} characters"),
+        });
+    }
+    Ok(password_key(password))
+}
+
+/// Serializes, compresses and seals a payload under a password.
+pub fn seal(payload: &BackupPayload, password: &str) -> CoreResult<Vec<u8>> {
+    let key = sealing_key(password)?;
+    let json = serde_json::to_vec(payload)
+        .map_err(|e| CoreError::Internal(format!("backup serialization failed: {e}")))?;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let compressed = encoder
+        .write_all(&json)
+        .and_then(|_| encoder.finish())
+        .map_err(|e| CoreError::Internal(format!("backup compression failed: {e}")))?;
+    Ok(cipher::seal_with(BACKUP_MAGIC, &compressed, &key)?)
+}
+
+/// The refusal a backup from a newer Gerfaut gets, whichever part of
+/// it this build does not know: the envelope version, the key profile
+/// the password is derived under, or the payload schema. Its own code,
+/// and never the one a wrong password or a damaged file gets: a person
+/// holding the right password would only type it again.
+fn newer_gerfaut(unknown: &str) -> CoreError {
+    CoreError::NewerBackup(format!(
+        "this backup was written by a newer Gerfaut ({unknown}); update Gerfaut to open it"
+    ))
+}
+
+/// Opens a sealed backup. A wrong password and a tampered file are one
+/// and the same failure; a file that is not a backup, or one the
+/// password opens but that holds no wallet list, is unreadable; a file
+/// written by a newer Gerfaut, at any layer of its format, is refused
+/// by name rather than half-read or blamed on the password.
+///
+/// A password too short to seal a backup is held to no rule here: no
+/// backup opens with it, so it is a wrong password, said as one once
+/// the file is known for a backup, and never a length rule told to
+/// someone who is only trying to get their wallets back.
+pub fn open(bytes: &[u8], password: &str) -> CoreResult<BackupPayload> {
+    let key = password_key(password);
+    let compressed =
+        cipher::unseal_with(BACKUP_MAGIC, bytes, &key).map_err(|error| match error {
+            VaultError::UnsupportedVersion(version) => {
+                newer_gerfaut(&format!("file version {version}"))
+            }
+            VaultError::UnsupportedKdf(kdf) => newer_gerfaut(&format!("key profile {kdf}")),
+            // Another magic, or too short for a header.
+            VaultError::NotAVault => unreadable("this is not a Gerfaut backup"),
+            other => other.into(),
+        })?;
+    // Past the seal the password was right: what fails from here on is
+    // the file, never the person who typed it.
+    let damaged = |e: &dyn std::fmt::Display| unreadable(format!("this backup is damaged: {e}"));
+    let mut json = Vec::new();
+    // Bounded: zlib reaches a thousand to one, and a crafted file must
+    // not be able to inflate until the device gives up.
+    flate2::read::ZlibDecoder::new(&compressed[..])
+        .take(MAX_BACKUP_PAYLOAD as u64 + 1)
+        .read_to_end(&mut json)
+        .map_err(|e| damaged(&e))?;
+    if json.len() > MAX_BACKUP_PAYLOAD {
+        return Err(unreadable(
+            "this backup expands to far more than any wallet list",
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct Versioned {
+        version: u32,
+    }
+    let Versioned { version } = serde_json::from_slice(&json).map_err(|e| damaged(&e))?;
+    if version > BACKUP_VERSION {
+        return Err(newer_gerfaut(&format!("backup version {version}")));
+    }
+    serde_json::from_slice(&json).map_err(|e| damaged(&e))
+}
+
+/// Bytes of a backup handed over as text: bare base64 of the file, or
+/// the `gerfaut-backup:` form a scanned QR yields. Whitespace and line
+/// breaks are ignored either way, so a pasted file survives wrapping.
+pub fn decode_source(source: &str) -> CoreResult<Vec<u8>> {
+    // A backup of a hundred wallets is a few tens of kilobytes. Anything
+    // past the cap is not one, and decoding it would only spend memory
+    // to reach the same answer.
+    if source.len() > MAX_BACKUP_TEXT {
+        return Err(unreadable(
+            "this file is far too large to be a Gerfaut backup",
+        ));
+    }
+    let compact: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    // `get` and not a slice: the text may be anything a camera decoded,
+    // and a byte index that lands inside a character would panic.
+    let body = match compact.get(..BACKUP_PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(BACKUP_PREFIX) => &compact[BACKUP_PREFIX.len()..],
+        _ => compact.as_str(),
+    };
+    if body.is_empty() {
+        return Err(unreadable("nothing to restore"));
+    }
+    let padded = match body.len() % 4 {
+        0 => body.to_owned(),
+        rem => format!("{body}{}", "=".repeat(4 - rem)),
+    };
+    let bytes = data_encoding::BASE64
+        .decode(padded.as_bytes())
+        .map_err(|_| unreadable("expected the text of a backup file or a scanned backup"))?;
+    if !bytes.starts_with(BACKUP_MAGIC) {
+        return Err(unreadable("this is not a Gerfaut backup"));
+    }
+    Ok(bytes)
+}
+
+/// Frames of the animated QR carrying `bytes`: one `ur:bytes` part per
+/// fragment of the message, and nothing else. Bytes that fit a single
+/// fragment make one static frame.
+///
+/// No fountain mixes ride along. They earn their keep when the sender
+/// speaks once and cannot repeat itself; here the frames loop on
+/// screen until the scan is done, so a receiver joining at any frame
+/// has every fragment within one turn of the loop. Sending the mixes
+/// as well doubled that turn and made the progress dishonest: the
+/// scanner would climb to nine of ten, then sit there for seconds
+/// while frame after frame resolved nothing.
+pub fn frames(bytes: &[u8]) -> Vec<String> {
+    let mut message = Vec::with_capacity(bytes.len() + 8);
+    ciborium::into_writer(&Value::Bytes(bytes.to_vec()), &mut message)
+        .expect("writing CBOR to a vec cannot fail");
+    if message.len() <= MAX_FRAGMENT_LEN {
+        return vec![ur::ur::encode(&message, &ur::ur::Type::Bytes)];
+    }
+    let mut encoder = ur::ur::Encoder::bytes(&message, MAX_FRAGMENT_LEN)
+        .expect("the message is not empty and the fragment length is not zero");
+    (0..encoder.fragment_count())
+        .map(|_| {
+            encoder
+                .next_part()
+                .expect("encoding a fountain part to CBOR cannot fail")
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+    use crate::input::ScriptKind;
+    use crate::input::qr::{QrFormat, assemble};
+
+    const PASSWORD: &str = "correct horse battery staple";
+    /// Public two-path key from the BDK documentation.
+    const TPUB: &str = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+
+    fn payload() -> BackupPayload {
+        BackupPayload {
+            version: BACKUP_VERSION,
+            created_at: 1_755_000_000,
+            wallets: vec![
+                BackupWallet {
+                    name: "Cold storage".to_owned(),
+                    network: Network::Signet,
+                    kind: WalletKind::Descriptors {
+                        external: format!("wpkh({TPUB}/0/*)#checksum"),
+                        internal: Some(format!("wpkh({TPUB}/1/*)#checksum")),
+                        script: ScriptKind::Segwit,
+                    },
+                    gap_limit: 20,
+                    labels: BTreeMap::from([("addr:tb1q".to_owned(), "rent".to_owned())]),
+                    created_at: 1_754_000_000,
+                    live_pinned: true,
+                },
+                BackupWallet {
+                    name: "Watched".to_owned(),
+                    network: Network::Mainnet,
+                    kind: WalletKind::SingleAddress {
+                        address: "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4".to_owned(),
+                    },
+                    gap_limit: 20,
+                    labels: BTreeMap::new(),
+                    created_at: 1_754_000_001,
+                    live_pinned: false,
+                },
+            ],
+            backends: Some(BTreeMap::from([(
+                Network::Signet,
+                BackendConfig::CustomEsplora {
+                    url: "https://esplora.example.org/api".to_owned(),
+                    own_node: false,
+                },
+            )])),
+            electrum_certs: Some(BTreeMap::from([(
+                "electrum.example.org:50002".to_owned(),
+                "AB:CD".to_owned(),
+            )])),
+            gap_limit: Some(50),
+        }
+    }
+
+    #[test]
+    fn seal_open_roundtrip() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        assert_eq!(&sealed[..8], BACKUP_MAGIC);
+        let opened = open(&sealed, PASSWORD).unwrap();
+        assert_eq!(opened, payload());
+        assert!(opened.has_settings());
+        // Whitespace around the password is not part of it.
+        assert_eq!(
+            open(&sealed, &format!("  {PASSWORD}\n")).unwrap(),
+            payload()
+        );
+    }
+
+    #[test]
+    fn settings_are_absent_when_not_exported() {
+        let bare = BackupPayload {
+            backends: None,
+            electrum_certs: None,
+            gap_limit: None,
+            ..payload()
+        };
+        assert!(!bare.has_settings());
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(!json.contains("backends"), "{json}");
+        let opened = open(&seal(&bare, PASSWORD).unwrap(), PASSWORD).unwrap();
+        assert_eq!(opened, bare);
+    }
+
+    /// A wallet pinned to the live watch says so in the backup; one that
+    /// is not says nothing, the way a backup written before pinning
+    /// existed reads.
+    #[test]
+    fn a_pin_rides_along_only_when_set() {
+        let json = serde_json::to_string(&payload()).unwrap();
+        assert_eq!(json.matches(r#""live_pinned":true"#).count(), 1, "{json}");
+        assert!(!json.contains(r#""live_pinned":false"#), "{json}");
+        let older = r#"{"name":"Old","network":"signet","kind":{"type":"single_address","address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},"gap_limit":20,"created_at":1}"#;
+        let wallet: BackupWallet = serde_json::from_str(older).unwrap();
+        assert!(!wallet.live_pinned);
+        assert_eq!(
+            serde_json::to_string(&wallet).unwrap(),
+            older.replace(r#""gap_limit":20,"#, r#""gap_limit":20,"labels":{},"#,)
+        );
+    }
+
+    #[test]
+    fn wrong_password_fails_closed() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        assert!(matches!(
+            open(&sealed, "correct horse battery stapler"),
+            Err(CoreError::Vault(VaultError::WrongKeyOrCorrupted))
+        ));
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let mut sealed = seal(&payload(), PASSWORD).unwrap();
+        let middle = sealed.len() / 2;
+        sealed[middle] ^= 0x01;
+        assert!(matches!(
+            open(&sealed, PASSWORD),
+            Err(CoreError::Vault(VaultError::WrongKeyOrCorrupted))
+        ));
+    }
+
+    #[test]
+    fn short_passwords_are_refused() {
+        let error = seal(&payload(), "  short ").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CoreError::InvalidInput {
+                    kind: "backup password",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    /// A password shorter than any backup is sealed under can only be
+    /// wrong: it fails as a wrong password does, the empty one
+    /// included, and a file that is not a backup still says so first.
+    #[test]
+    fn a_short_password_opens_nothing_and_is_a_wrong_one() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        for short in ["short", "  1234567 ", ""] {
+            assert!(
+                matches!(
+                    open(&sealed, short),
+                    Err(CoreError::Vault(VaultError::WrongKeyOrCorrupted))
+                ),
+                "{short:?}"
+            );
+        }
+        assert_eq!(
+            open(&sealed, "short").unwrap_err().code(),
+            ErrorCode::WrongKey
+        );
+        assert!(matches!(
+            open(b"not a backup at all, only text", "short"),
+            Err(CoreError::UnreadableBackup(_))
+        ));
+    }
+
+    #[test]
+    fn newer_versions_are_refused_by_name() {
+        let future = BackupPayload {
+            version: BACKUP_VERSION + 1,
+            ..payload()
+        };
+        let sealed = seal(&future, PASSWORD).unwrap();
+        let error = open(&sealed, PASSWORD).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::NewerFormat, "{error}");
+        assert!(error.to_string().contains("version 2"), "{error}");
+        assert!(error.to_string().contains("newer Gerfaut"), "{error}");
+    }
+
+    /// A backup whose header names a key profile or an envelope version
+    /// this build does not know was written by a newer Gerfaut. It is
+    /// refused under that name, with a code of its own, and never as
+    /// the wrong-password failure the restore screens word as "wrong
+    /// password, or the file is damaged".
+    #[test]
+    fn a_file_from_a_newer_gerfaut_is_not_blamed_on_the_password() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let wrong_password = open(&sealed, "correct horse battery stapler").unwrap_err();
+        assert!(matches!(
+            wrong_password,
+            CoreError::Vault(VaultError::WrongKeyOrCorrupted)
+        ));
+
+        // The key profile byte, then the envelope version byte, forged
+        // to values no build has assigned yet.
+        for (offset, forged, named) in [(9, 3u8, "key profile 3"), (8, 3u8, "file version 3")] {
+            let mut newer = sealed.clone();
+            newer[offset] = forged;
+            let error = open(&newer, PASSWORD).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::NewerFormat, "{error}");
+            let message = error.to_string();
+            assert_eq!(
+                message,
+                format!(
+                    "invalid backup: this backup was written by a newer Gerfaut ({named}); update Gerfaut to open it"
+                )
+            );
+            assert_ne!(message, wrong_password.to_string());
+            assert!(!message.contains("password"), "{message}");
+            assert!(!message.contains("corrupt"), "{message}");
+            // The right password is not what is missing: the same file
+            // with the wrong one gets the same answer.
+            assert_eq!(
+                open(&newer, "correct horse battery stapler")
+                    .unwrap_err()
+                    .to_string(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn a_vault_is_not_a_backup() {
+        let key = VaultKey::Password(PASSWORD.to_owned());
+        let vault = cipher::seal(b"{}", &key).unwrap();
+        for bytes in [&vault[..], b"garbage"] {
+            let error = open(bytes, PASSWORD).unwrap_err();
+            assert!(matches!(error, CoreError::UnreadableBackup(_)), "{error}");
+            assert_eq!(
+                error.to_string(),
+                "invalid backup: this is not a Gerfaut backup"
+            );
+        }
+    }
+
+    /// What the restore screens decide on, met the way they meet it:
+    /// "wrong password" is the answer to a wrong password and to a file
+    /// altered under its seal, and to nothing else. A file that is not
+    /// a backup, or one the seal no longer guards, is unreadable; one
+    /// from a newer Gerfaut says so.
+    #[test]
+    fn each_refusal_reaches_the_screens_under_its_own_code() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let code = |bytes: &[u8], password: &str| open(bytes, password).unwrap_err().code();
+
+        // A file altered under its seal is the same failure to the
+        // cipher: `tampering_is_detected`.
+        assert_eq!(
+            code(&sealed, "correct horse battery stapler"),
+            ErrorCode::WrongKey
+        );
+
+        let vault = cipher::seal(b"{}", &VaultKey::Raw([7; 32])).unwrap();
+        // Cut inside the header, there is nothing left to try a
+        // password on.
+        for unreadable in [&vault[..], b"garbage", &sealed[..20]] {
+            assert_eq!(code(unreadable, PASSWORD), ErrorCode::UnreadableBackup);
+            // Whatever the password, it is not what is in question.
+            assert_eq!(
+                code(unreadable, "correct horse battery stapler"),
+                ErrorCode::UnreadableBackup
+            );
+        }
+        // Sealed under the right password, but not a compressed wallet
+        // list: the password opened it, the file is at fault.
+        let key = VaultKey::Password(PASSWORD.to_owned());
+        for inside in [&b"not zlib at all"[..], b"x\x9c\x03\x00\x00\x00\x00\x01"] {
+            let odd = cipher::seal_with(BACKUP_MAGIC, inside, &key).unwrap();
+            let error = open(&odd, PASSWORD).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::UnreadableBackup, "{error}");
+            assert!(error.to_string().contains("damaged"), "{error}");
+        }
+
+        let mut newer = sealed.clone();
+        newer[8] = 3;
+        assert_eq!(code(&newer, PASSWORD), ErrorCode::NewerFormat);
+
+        // Text read the way the restore reads it; the last one is the
+        // magic alone.
+        for text in ["", "not base64 at all!", "R0ZCQUNLVVA="] {
+            let refused = decode_source(text)
+                .and_then(|bytes| open(&bytes, PASSWORD))
+                .unwrap_err();
+            assert_eq!(refused.code(), ErrorCode::UnreadableBackup, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn decode_source_tolerates_every_text_form() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let base64 = data_encoding::BASE64.encode(&sealed);
+
+        assert_eq!(decode_source(&base64).unwrap(), sealed);
+        assert_eq!(
+            decode_source(&format!("{BACKUP_PREFIX}{base64}")).unwrap(),
+            sealed
+        );
+        assert_eq!(
+            decode_source(&format!("Gerfaut-Backup:{base64}")).unwrap(),
+            sealed
+        );
+        let wrapped: String = base64
+            .as_bytes()
+            .chunks(64)
+            .map(|line| format!("{}\r\n", std::str::from_utf8(line).unwrap()))
+            .collect();
+        assert_eq!(decode_source(&format!("\n  {wrapped} \t")).unwrap(), sealed);
+        let unpadded = base64.trim_end_matches('=');
+        assert_eq!(decode_source(unpadded).unwrap(), sealed);
+    }
+
+    #[test]
+    fn decode_source_rejects_what_is_not_a_backup() {
+        for garbage in ["", "   ", "not base64 at all!", "wpkh(abc)", BACKUP_PREFIX] {
+            let error = decode_source(garbage).unwrap_err();
+            assert!(
+                matches!(error, CoreError::UnreadableBackup(_)),
+                "{garbage:?}: {error}"
+            );
+        }
+        // Valid base64 of something else, a vault file included.
+        let key = VaultKey::Password(PASSWORD.to_owned());
+        let vault = data_encoding::BASE64.encode(&cipher::seal(b"{}", &key).unwrap());
+        let error = decode_source(&vault).unwrap_err();
+        assert!(
+            error.to_string().contains("not a Gerfaut backup"),
+            "{error}"
+        );
+    }
+
+    /// A wallet list the size of a real one, scanned the way a phone
+    /// scans it: joining the loop wherever it happens to be, assembling
+    /// again after every new frame.
+    ///
+    /// Two things are guarded. One turn of the loop is enough, whatever
+    /// frame it started on — nobody should have to hold a phone up for
+    /// a second pass. And the count only ever climbs by one, because a
+    /// progress bar that jumps from five to nine and then stalls reads
+    /// as a scanner that has crashed.
+    #[test]
+    fn a_phone_completes_within_one_turn_of_the_loop() {
+        let mut payload = payload();
+        let template = payload.wallets[0].clone();
+        payload.wallets = (0..10)
+            .map(|i| {
+                let mut wallet = template.clone();
+                wallet.name = format!("Wallet number {i}");
+                wallet.kind = WalletKind::Descriptors {
+                    external: format!("wpkh([{i:08x}/84'/0'/{i}']{TPUB}/0/*)#checksum"),
+                    internal: Some(format!("wpkh([{i:08x}/84'/0'/{i}']{TPUB}/1/*)#checksum")),
+                    script: ScriptKind::Segwit,
+                };
+                // Labels weigh what real ones weigh: a vault of ten
+                // wallets is not ten copies of one, and the compressor
+                // must not be handed a list that folds to nothing.
+                wallet.labels = (0..6)
+                    .map(|l| {
+                        (
+                            format!("addr:bc1q{i}{l}{}", "x7k29fq3".repeat(3)),
+                            format!("label {i}-{l} {}", "note-text-here ".repeat(2)),
+                        )
+                    })
+                    .collect();
+                wallet
+            })
+            .collect();
+
+        let sealed = seal(&payload, PASSWORD).unwrap();
+        let frames = frames(&sealed);
+        assert!(
+            frames.len() >= 5,
+            "the fixture should span a real animation: {} frames",
+            frames.len()
+        );
+        let expected = format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&sealed));
+
+        for start in [0, 1, frames.len() / 2, frames.len() - 1] {
+            let mut collected: Vec<String> = Vec::new();
+            let mut last = 0;
+            for step in 0..frames.len() {
+                collected.push(frames[(start + step) % frames.len()].clone());
+                let progress = assemble(&collected).unwrap();
+                assert_eq!(progress.format, QrFormat::Ur);
+                assert_eq!(progress.total as usize, frames.len());
+                assert_eq!(
+                    progress.received,
+                    last + 1,
+                    "frame {step} from {start} resolved {} fragments, not one",
+                    progress.received as i64 - last as i64
+                );
+                last = progress.received;
+                assert_eq!(progress.complete, step + 1 == frames.len());
+            }
+            let progress = assemble(&collected).unwrap();
+            assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+        }
+
+        // And what a camera actually reads assembles the same way. Both
+        // screens draw the frames in upper case, so that — not the form
+        // the encoder returned — is the text a scan hands to the core.
+        let shouted: Vec<String> = frames.iter().map(|f| f.to_uppercase()).collect();
+        let progress = assemble(&shouted).unwrap();
+        assert!(progress.complete);
+        assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+
+        // And what came out is the backup that went in.
+        let restored = open(&decode_source(&expected).unwrap(), PASSWORD).unwrap();
+        assert_eq!(restored.wallets.len(), 10);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn frames_assemble_from_any_starting_point() {
+        let sealed = seal(&payload(), PASSWORD).unwrap();
+        let frames = frames(&sealed);
+        let expected = format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&sealed));
+
+        let parts = frames[0]
+            .split('/')
+            .nth(1)
+            .and_then(|seq| seq.split_once('-'))
+            .and_then(|(_, total)| total.parse::<usize>().ok())
+            .expect("multi-part header");
+        assert!(parts > 1, "the sealed bytes span several fragments");
+        assert_eq!(frames.len(), parts, "one frame per fragment, no mixes");
+        assert!(frames.iter().all(|f| f.starts_with("ur:bytes/")));
+
+        let progress = assemble(&frames).unwrap();
+        assert!(progress.complete);
+        assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+        assert_eq!(decode_source(&expected).unwrap(), sealed);
+
+        // Joining the loop midway: mixes first, pure fragments last.
+        let offset = parts / 2 + 1;
+        let rotated: Vec<String> = frames[offset..]
+            .iter()
+            .chain(&frames[..offset])
+            .cloned()
+            .collect();
+        let progress = assemble(&rotated).unwrap();
+        assert!(progress.complete);
+        assert_eq!(progress.text.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn a_small_backup_is_one_static_frame() {
+        let mut bytes = BACKUP_MAGIC.to_vec();
+        bytes.extend([7u8; 30]);
+        let frames = frames(&bytes);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].matches('/').count(), 1, "no sequence header");
+        let progress = assemble(&frames).unwrap();
+        assert!(progress.complete);
+        assert_eq!(
+            progress.text.unwrap(),
+            format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&bytes))
+        );
+    }
+
+    /// The frame count follows the fragment size: a payload the size of
+    /// a real backup makes the number of frames the constant promises,
+    /// each of a size a phone camera reads, and anything that fits one
+    /// fragment is still a single static frame.
+    #[test]
+    fn frames_are_as_dense_as_the_fragment_size_says() {
+        // Three kilobytes wrap in three CBOR bytes: 3003 bytes to split.
+        let mut payload = BACKUP_MAGIC.to_vec();
+        payload.resize(3000, 0x5a);
+        let frames = frames(&payload);
+        assert_eq!(frames.len(), 3003_usize.div_ceil(MAX_FRAGMENT_LEN));
+        assert_eq!(frames.len(), 19);
+        // A version-12 QR code at medium error correction holds 419
+        // alphanumeric characters; every frame must fit one.
+        let longest = frames.iter().map(String::len).max().unwrap();
+        assert!(longest <= 419, "{longest} characters");
+        let progress = assemble(&frames).unwrap();
+        assert!(progress.complete);
+        assert_eq!(
+            progress.text.unwrap(),
+            format!("{BACKUP_PREFIX}{}", data_encoding::BASE64.encode(&payload))
+        );
+
+        // Right at the edge: 158 bytes plus a two-byte CBOR header fill
+        // one fragment exactly, one byte more takes two frames.
+        assert_eq!(super::frames(&[1u8; MAX_FRAGMENT_LEN - 2]).len(), 1);
+        assert_eq!(super::frames(&[1u8; MAX_FRAGMENT_LEN - 1]).len(), 2);
+    }
+
+    #[test]
+    fn an_absurd_file_is_refused_before_it_is_decoded() {
+        // Whatever this is, it is not a wallet list: say so instead of
+        // spending memory to find out.
+        let huge = "A".repeat(MAX_BACKUP_TEXT + 1);
+        let refused = decode_source(&huge).unwrap_err();
+        assert!(
+            matches!(refused, CoreError::UnreadableBackup(_)),
+            "{refused}"
+        );
+        assert!(refused.to_string().contains("too large"), "{refused}");
+    }
+
+    #[test]
+    fn text_that_is_not_ascii_is_refused_not_a_panic() {
+        // A camera decodes whatever is in front of it: the prefix test
+        // must never index into the middle of a character.
+        for text in ["éééééééé", "🙂🙂🙂🙂", "gerfaut-backué:AAAA"] {
+            assert!(decode_source(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_payload_that_inflates_without_end_is_refused() {
+        // A megabyte of zeroes compresses to almost nothing; a payload
+        // past the cap must be stopped rather than read to the end.
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0u8; MAX_BACKUP_PAYLOAD + 1024])
+            .unwrap();
+        let bomb = encoder.finish().unwrap();
+        assert!(
+            bomb.len() < 100_000,
+            "the bomb should be small: {}",
+            bomb.len()
+        );
+
+        let key = password_key(PASSWORD);
+        let sealed = cipher::seal_with(BACKUP_MAGIC, &bomb, &key).unwrap();
+        let refused = open(&sealed, PASSWORD).unwrap_err();
+        assert!(
+            refused.to_string().contains("expands to far more"),
+            "{refused}"
+        );
+    }
+}

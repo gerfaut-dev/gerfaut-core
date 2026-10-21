@@ -1,0 +1,2313 @@
+//! Chain data sources: backend configuration and synchronization.
+//!
+//! And what every request of the core to a server keeps to, the price
+//! and the update check included: what a server's words may show on a
+//! screen (`server_words`), and which redirections a client follows
+//! (`redirects`).
+
+pub mod connect;
+mod dial;
+pub(crate) mod electrum;
+pub(crate) mod esplora;
+mod fault;
+pub(crate) mod net;
+pub(crate) mod proof;
+pub mod public;
+pub(crate) mod tls;
+pub mod tor;
+
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bdk_wallet::KeychainKind;
+use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bdk_wallet::chain::{CheckPoint, ConfirmationBlockTime};
+use serde::{Deserialize, Serialize};
+use url::{Host, ParseError, Url};
+
+pub(crate) use fault::{Fault, FaultKind, IoOutage};
+
+use crate::error::{CoreError, CoreResult};
+use crate::network::Network;
+use crate::wallet::AddressWatchState;
+
+/// Where a wallet's chain data comes from.
+///
+/// One configuration per network is stored in the settings; wallets on
+/// that network all use it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BackendConfig {
+    /// One of the public servers listed in [`public`]. Without a chosen
+    /// operator, the public Esplora instances are tried in order. The
+    /// honest default: the server that answers sees the wallet's
+    /// addresses, and the settings screen says so.
+    ///
+    /// The tag stays `public_esplora`, the spelling every stored vault
+    /// already carries, and `server` is omitted when unset so an
+    /// automatic configuration serializes exactly as it always did.
+    #[serde(rename = "public_esplora")]
+    Public {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
+    },
+    /// The user's own Esplora-compatible HTTP endpoint.
+    CustomEsplora {
+        url: String,
+        /// See [`BackendConfig::is_own_node`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        own_node: bool,
+    },
+    /// The user's own Electrum server, `ssl://host:port` or
+    /// `tcp://host:port`.
+    CustomElectrum {
+        url: String,
+        /// See [`BackendConfig::is_own_node`].
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        own_node: bool,
+    },
+}
+
+impl Default for BackendConfig {
+    fn default() -> Self {
+        BackendConfig::Public { server: None }
+    }
+}
+
+impl BackendConfig {
+    /// Short human-readable identifier for sync reports and logs:
+    /// the host, never a full URL with potential credentials.
+    pub fn label(&self, network: Network) -> String {
+        match self {
+            BackendConfig::Public { server } => server
+                .as_deref()
+                .and_then(|id| public::find(network, id))
+                .map(|entry| entry.label().to_owned())
+                .or_else(|| {
+                    network
+                        .default_esplora_urls()
+                        .first()
+                        .and_then(|url| host_of(url))
+                })
+                .unwrap_or_else(|| "public esplora".to_owned()),
+            BackendConfig::CustomEsplora { url, .. }
+            | BackendConfig::CustomElectrum { url, .. } => {
+                host_of(url).unwrap_or_else(|| "custom backend".to_owned())
+            }
+        }
+    }
+
+    /// Whether the user said this server is their own node. Nothing
+    /// checks it: the app cannot tell a node at home from a public
+    /// server typed in by hand. What it changes is how much the live
+    /// watch asks of the server ([`crate::watch::WatchLimits`]): a
+    /// public server charges every subscription to the session and
+    /// refuses them past a limit of its own, a node of one's own serves
+    /// all it is asked. The public backend never is one. Off unless
+    /// set, and left out of the stored form while off, so a vault or a
+    /// backup written before it existed reads and writes back the same.
+    pub fn is_own_node(&self) -> bool {
+        match self {
+            BackendConfig::Public { .. } => false,
+            BackendConfig::CustomEsplora { own_node, .. }
+            | BackendConfig::CustomElectrum { own_node, .. } => *own_node,
+        }
+    }
+
+    /// The configuration with a custom address in the form the settings
+    /// store it in ([`connect::stored_form`]), or the reason the address
+    /// cannot be read. Everything that takes a configuration from
+    /// outside the settings screen goes through here too: a vault
+    /// written before addresses were stored that way, a backup made by
+    /// such a vault. Read as typed, `tcp://x.onion:50001:extra` names no
+    /// host to the URL parser, so no onion, and would reach the
+    /// resolver in the clear. An address already in that form comes
+    /// back byte for byte.
+    pub fn canonical(self) -> CoreResult<Self> {
+        use connect::ScannedBackendKind::{Electrum, Esplora};
+        Ok(match self {
+            BackendConfig::CustomEsplora { url, own_node } => BackendConfig::CustomEsplora {
+                url: connect::stored_form(Esplora, &url)?,
+                own_node,
+            },
+            BackendConfig::CustomElectrum { url, own_node } => BackendConfig::CustomElectrum {
+                url: connect::stored_form(Electrum, &url)?,
+                own_node,
+            },
+            public @ BackendConfig::Public { .. } => public,
+        })
+    }
+}
+
+/// What a server whose genesis block is another network's is refused
+/// with.
+pub(crate) const ANOTHER_NETWORK: &str = "the server is on another network";
+
+/// Whether a block is the genesis block of `network`.
+pub(crate) fn is_genesis_of(network: Network, hash: bdk_wallet::bitcoin::BlockHash) -> bool {
+    bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin()).block_hash() == hash
+}
+
+/// How far below the height a wallet or a watch holds a server's tip may
+/// read and still be a server that lags: past a day of blocks, the
+/// height held was never a real one.
+pub(crate) const TIP_LAG_MAX: u32 = 144;
+
+/// What a server is refused with when it is behind a block of the
+/// wallet that holds a confirmation, and its answer would take that
+/// block out ([`drops_a_confirmation`]).
+pub(crate) const BEHIND: &str = "the server is behind a confirmation the wallet holds";
+
+/// Whether a server whose tip is `server_tip`, more than [`TIP_LAG_MAX`]
+/// below the wallet's, would have the wallet drop a block holding one of
+/// its confirmations, at the heights in `confirmed`. On mainnet such a
+/// block carries the work of its height, and none at a height a chain
+/// can have reached (`limit`) was made up: the server lags, or hides
+/// it, and is refused rather than followed. Where work proves nothing,
+/// the blocks go, as any a server made up.
+pub(crate) fn drops_a_confirmation(
+    network: Network,
+    mut confirmed: impl Iterator<Item = u32>,
+    server_tip: u32,
+    limit: u32,
+) -> bool {
+    network == Network::Mainnet && confirmed.any(|height| height > server_tip && height <= limit)
+}
+
+/// What a server whose tip is higher than any chain of its network can
+/// have reached is refused with.
+pub(crate) const IMPOSSIBLE_TIP: &str = "the server claims a block height no chain has reached";
+
+/// What a server whose tip is a header without the work of its height is
+/// refused with.
+pub(crate) const UNWORKED_TIP: &str = "the server's tip is a header no one mined";
+
+/// The tip a server announced over Electrum, `height` and its `header`,
+/// checked as the sync of a descriptor wallet checks it: no higher than
+/// any chain of `network` can have reached ([`height_limit`]), and with
+/// the work `network` asks for at that height ([`has_proof_of_work`]).
+/// Without them, a server makes a sent transaction or a watched address
+/// as deep in the chain as it cares to say. No request: the header comes
+/// with the height.
+pub(crate) fn checked_tip(
+    network: Network,
+    height: u32,
+    header: &bdk_wallet::bitcoin::block::Header,
+) -> Result<u32, Fault> {
+    if height > height_limit(network, crate::now_secs()) {
+        return Err(Fault::other(IMPOSSIBLE_TIP));
+    }
+    if !has_proof_of_work(network, height, header) {
+        return Err(Fault::other(UNWORKED_TIP));
+    }
+    Ok(height)
+}
+
+/// What a transaction does to an address, from what it pays it and what
+/// it spends of it, as a server tells both: past what a signed number
+/// holds, which no coin comes near and a server may still claim, it
+/// stops there instead of wrapping around to its opposite.
+pub(crate) fn net_sats(received: u64, spent: u64) -> i64 {
+    let signed = |sats: u64| i64::try_from(sats).unwrap_or(i64::MAX);
+    signed(received).saturating_sub(signed(spent))
+}
+
+/// The longest a server's words are shown, in characters.
+pub(crate) const SERVER_WORDS_MAX: usize = 200;
+
+/// What a server wrote, a refusal or an error, kept to what a screen may
+/// show it as: one line of 200 characters at most, an ellipsis past them,
+/// without the control characters that break a line or the marks that
+/// turn the text around them
+/// ([`crate::wallet::tx_extras::is_bidi_control`]). Anyone who runs a
+/// server writes them, and they end up on a screen beside amounts.
+pub(crate) fn server_words(text: &str) -> String {
+    let mut kept = text
+        .chars()
+        .filter(|c| !c.is_control() && !crate::wallet::tx_extras::is_bidi_control(*c));
+    let mut short: String = kept.by_ref().take(SERVER_WORDS_MAX).collect();
+    if kept.next().is_some() {
+        short.push('\u{2026}');
+    }
+    short
+}
+
+/// What every HTTP client of the core is built from: one that takes no
+/// proxy but the one its caller sets, the Tor proxy. Left to itself,
+/// reqwest sends its requests through whatever `HTTP_PROXY`,
+/// `HTTPS_PROXY` or `ALL_PROXY` the environment names, which the
+/// Electrum connections never did: the price and update checks and
+/// every Esplora sync would leave the machine by a route the person
+/// never chose, and the choice of Tor in the settings would not be the
+/// whole story of where they go.
+///
+/// Its TLS is the core's own: ring, and the public authorities of
+/// `webpki-roots`, the ones an Electrum server is checked against.
+/// Left to itself, reqwest asks the operating system which authorities
+/// to trust, which on Android needs the app to hand it a Java context
+/// first, and panics when no crypto provider was installed before it.
+/// Should the configuration fail to build, the client trusts no
+/// authority at all: every HTTPS request fails, none goes out unchecked.
+pub(crate) fn http_client() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder().no_proxy();
+    match tls::public_config() {
+        Ok(config) => {
+            let mut config = (*config).clone();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            builder.tls_backend_preconfigured(config)
+        }
+        Err(_) => builder.tls_certs_only(Vec::new()),
+    }
+}
+
+/// How long a direct connection of an HTTP client of the core may take
+/// to open, its TCP and TLS handshakes together. reqwest gives each
+/// address a name resolves to its share of it and then tries the next,
+/// so an address that ignores the connection costs its share. Without
+/// it, that address holds the connection until the request's own time
+/// is up, and the request fails though the other addresses answer.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The route of a request to a public service: through the Tor proxy
+/// when there is one, `socks5h` so the proxy resolves the name and an
+/// onion never reaches this machine's resolver, with the request's
+/// whole time for the circuit; directly otherwise, within
+/// [`CONNECT_TIMEOUT`].
+pub(crate) fn route(
+    builder: reqwest::ClientBuilder,
+    proxy: Option<&str>,
+) -> reqwest::Result<reqwest::ClientBuilder> {
+    Ok(match proxy {
+        Some(proxy) => builder.proxy(reqwest::Proxy::all(format!("socks5h://{proxy}"))?),
+        None => builder.connect_timeout(CONNECT_TIMEOUT),
+    })
+}
+
+/// Whether a client sends its requests through a proxy of any kind.
+/// The client prints its proxies, and one left to read the environment
+/// counts the system's among them, whatever the environment holds.
+#[cfg(test)]
+pub(crate) fn takes_a_proxy(client: &reqwest::Client) -> bool {
+    format!("{client:?}").contains("proxies")
+}
+
+/// The redirections an HTTP client of the core follows, to fixed public
+/// services: to the same host, port and scheme, over HTTPS, five at
+/// most. One anywhere else ends there, as an answer that is no success:
+/// it would carry the request where its route was never checked, in the
+/// clear, or an onion name to the system's resolver.
+pub(crate) fn redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if same && attempt.url().scheme() == "https" && attempt.previous().len() <= 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
+/// What one sync may keep of the transactions it reads, those the wallet
+/// lacks: what it stores then. A wallet paid dozens of the largest
+/// inscriptions there are fits; a server that invents transactions to
+/// fill memory does not.
+pub(crate) const KEEP_MAX: usize = 256 << 20;
+
+/// What a sync kept so far of the transactions it read, held to a cap.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    bytes: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Kept {
+    pub(crate) fn up_to(max: usize) -> Self {
+        Kept {
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            max,
+        }
+    }
+
+    /// Counts `bytes` of transactions against the cap.
+    pub(crate) fn add(&self, bytes: usize) -> Result<(), String> {
+        let kept = self
+            .bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(bytes);
+        if kept > self.max {
+            return Err(format!(
+                "the server sent more than {} MiB of transactions for one sync",
+                self.max >> 20
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// About what a transaction of a watched address holds in memory, all of
+/// which its sync keeps and stores: its raw bytes in hex, and each of its
+/// inputs and outputs, however many a server lists.
+pub(crate) fn held_by(tx: &crate::wallet::AddressTx) -> usize {
+    use crate::wallet::snapshot::TxIo;
+    let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+    let side = |io: &TxIo| {
+        std::mem::size_of::<TxIo>()
+            + text(&io.address)
+            + text(&io.prev_txid)
+            + io.op_return.as_ref().map_or(0, |data| {
+                data.hex.len() + text(&data.text) + text(&data.label)
+            })
+    };
+    let extras = tx.extras.as_ref().map_or(0, |extras| {
+        extras.raw_hex.len() + text(&extras.coinbase_pool) + text(&extras.coinbase_tag)
+    });
+    std::mem::size_of::<crate::wallet::AddressTx>()
+        + tx.txid.len()
+        + extras
+        + tx.inputs.iter().chain(&tx.outputs).map(side).sum::<usize>()
+}
+
+/// The fastest a chain is taken to have grown since its genesis block,
+/// in seconds per block: ten times the pace of every network there is.
+const FASTEST_BLOCK_SECS: u64 = 60;
+/// A time this code was written after, 1 October 2026: a device clock
+/// that reads earlier is wrong, and is not believed over it.
+const WRITTEN_AFTER: u64 = 1_790_812_800;
+
+/// The highest block a chain of `network` can have reached at `now`, in
+/// unix seconds: one block a minute since its genesis block, ten times
+/// any pace there is, with a clock set back read as the day this was
+/// written. Loose on purpose, since a clock may be wrong, and enough to
+/// refuse a tip of four billion, which a lying server once had only to
+/// send for it to stay in the wallet's chain for good. A regtest chain
+/// is made at will, and has none.
+pub(crate) fn height_limit(network: Network, now: u64) -> u32 {
+    if network == Network::Regtest {
+        return u32::MAX;
+    }
+    let genesis = bdk_wallet::bitcoin::constants::genesis_block(network.to_bitcoin());
+    let elapsed = now
+        .max(WRITTEN_AFTER)
+        .saturating_sub(u64::from(genesis.header.time));
+    u32::try_from(elapsed / FASTEST_BLOCK_SECS).unwrap_or(u32::MAX)
+}
+
+pub(crate) use proof::has_proof_of_work;
+
+/// Whether a backend URL points at a Tor hidden service. Onion hosts
+/// are routed through the Tor proxy [`tor`] resolves, never looked up.
+///
+/// Host names have no case, and a QR code prints them in capitals: an
+/// address read as `.ONION` is the same hidden service, and taking it
+/// for a clearnet host would hand its name to the resolver.
+pub(crate) fn is_onion(url: &str) -> bool {
+    host_of(url).is_some_and(|host| is_onion_host(&host))
+}
+
+/// Whether a bare host name is a hidden service, in whatever case it
+/// was spelled, and with or without the trailing dot a fully qualified
+/// name may carry: `x.onion.` names the same service as `x.onion`, and
+/// a resolver handed either would tell the world about it. Compared on
+/// bytes: the name may be anything a camera decoded, and a byte index
+/// into the middle of a character would panic.
+pub(crate) fn is_onion_host(host: &str) -> bool {
+    const SUFFIX: &[u8] = b".onion";
+    let bytes = host.as_bytes();
+    let bytes = bytes.strip_suffix(b".").unwrap_or(bytes);
+    bytes.len() >= SUFFIX.len() && bytes[bytes.len() - SUFFIX.len()..].eq_ignore_ascii_case(SUFFIX)
+}
+
+/// Whether reaching this list means going through Tor. The manager asks
+/// before resolving a route, so clearnet-only syncs never touch Tor.
+pub(crate) fn needs_tor(endpoints: &[Endpoint]) -> bool {
+    endpoints.iter().any(Endpoint::is_onion)
+}
+
+/// The host of a server address, without any userinfo.
+pub(crate) fn host_of(url: &str) -> Option<String> {
+    host_and_port(url).map(|(host, _)| host)
+}
+
+/// The host of a server address and the port it names, read by the
+/// URL parser the HTTP client reads with, so that whatever the two
+/// could disagree on is settled the client's way: under `http` and
+/// `https` a `\` ends the host, `%2E` is a dot, capitals are not, and
+/// the userinfo before an `@` is not the host. `ssl://` and `tcp://`
+/// are not schemes the standard knows; a host under them is read as
+/// written, then given the same reading, and a bare `host:port` is
+/// read as `ssl://`, the way the Electrum client reads it. An IPv6
+/// literal comes back without its brackets. `None` for anything that
+/// names no host a client could connect to.
+pub(crate) fn host_and_port(url: &str) -> Option<(String, Option<u16>)> {
+    let text = if url.contains("://") {
+        Cow::Borrowed(url)
+    } else {
+        Cow::Owned(format!("ssl://{url}"))
+    };
+    let parsed = Url::parse(&text).ok()?;
+    let host = host_of_parsed(&parsed)?;
+    Some((host, parsed.port()))
+}
+
+/// The host of a parsed URL in canonical form. Under a standard
+/// scheme the parser already read it; under any other it is the text
+/// as written, and this is where it gets the same reading.
+pub(crate) fn host_of_parsed(parsed: &Url) -> Option<String> {
+    let host = match parsed.host()? {
+        Host::Domain(domain) => canonical_host(domain).ok()?,
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
+    (!host.is_empty()).then_some(host)
+}
+
+/// A host as the URL standard reads it: percent-decoded, in lower
+/// case, an IP address in its canonical spelling, an IPv6 literal with
+/// or without brackets given back without them, and the trailing dot
+/// of a fully qualified name dropped. Refuses whatever a host cannot
+/// contain, a `\` or a space among them.
+pub(crate) fn canonical_host(host: &str) -> Result<String, ParseError> {
+    let literal = if host.contains(':') && !host.starts_with('[') {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
+    };
+    let host = match Host::parse(&literal)? {
+        Host::Domain(domain) => domain.strip_suffix('.').unwrap_or(&domain).to_owned(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
+    };
+    if host.is_empty() {
+        return Err(ParseError::EmptyHost);
+    }
+    Ok(host)
+}
+
+/// One concrete server to talk to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum Endpoint {
+    Esplora(String),
+    Electrum(electrum::Target),
+}
+
+impl Endpoint {
+    fn url(&self) -> &str {
+        match self {
+            Endpoint::Esplora(url) => url.as_str(),
+            Endpoint::Electrum(target) => target.url.as_str(),
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        host_of(self.url()).unwrap_or_else(|| "backend".to_owned())
+    }
+
+    /// What tells this server from any other a wallet may be synced
+    /// with: its protocol, its host and its port, never a path or what
+    /// comes before the host. The host alone does not:
+    /// `blockstream.info:700` is an Electrum server, and
+    /// `blockstream.info` the web API of the same operator, with limits
+    /// of its own.
+    pub(crate) fn key(&self) -> String {
+        let protocol = match self {
+            Endpoint::Esplora(_) => "esplora",
+            Endpoint::Electrum(_) => "electrum",
+        };
+        match host_and_port(self.url()) {
+            Some((host, Some(port))) => format!("{protocol} {host} {port}"),
+            Some((host, None)) => format!("{protocol} {host}"),
+            None => protocol.to_owned(),
+        }
+    }
+
+    pub(crate) fn is_onion(&self) -> bool {
+        is_onion(self.url())
+    }
+}
+
+/// Certificate fingerprints the user accepted, by `host:port`. Kept in
+/// the encrypted vault and handed to every Electrum connection.
+pub type TrustedCerts = BTreeMap<String, String>;
+
+/// The fingerprint accepted for this server, if any.
+fn pin_for(certs: &TrustedCerts, url: &str) -> Option<String> {
+    certs.get(&electrum::certificate_key(url)).cloned()
+}
+
+/// Resolves a backend configuration into concrete endpoints, in the
+/// order they should be tried. A custom address is read in its stored
+/// form whatever form the vault holds it in, and one that has none is
+/// refused here, before anything could connect to it.
+pub(crate) fn endpoints(
+    config: &BackendConfig,
+    network: Network,
+    certs: &TrustedCerts,
+) -> CoreResult<Vec<Endpoint>> {
+    let config = &config.clone().canonical()?;
+    match config {
+        // A chosen operator is the only endpoint: the point of picking
+        // one is that no other host sees these addresses.
+        BackendConfig::Public { server: Some(id) } => match public::find(network, id) {
+            Some(entry) => Ok(vec![match entry.protocol() {
+                public::ServerProtocol::Esplora => Endpoint::Esplora(entry.url().to_owned()),
+                public::ServerProtocol::Electrum => Endpoint::Electrum(electrum::Target::new(
+                    entry.url(),
+                    pin_for(certs, entry.url()),
+                )),
+            }]),
+            // A server dropped by a later version must not brick syncs:
+            // fall back to the rotation, which the settings also show.
+            None => automatic_endpoints(network),
+        },
+        BackendConfig::Public { server: None } => automatic_endpoints(network),
+        BackendConfig::CustomEsplora { url, .. } => Ok(vec![Endpoint::Esplora(url.clone())]),
+        BackendConfig::CustomElectrum { url, .. } => Ok(vec![Endpoint::Electrum(
+            electrum::Target::new(url.clone(), pin_for(certs, url)),
+        )]),
+    }
+}
+
+/// The public Esplora rotation: every operator for the network, tried in
+/// order so that one blocked or down instance never looks like an empty
+/// wallet.
+fn automatic_endpoints(network: Network) -> CoreResult<Vec<Endpoint>> {
+    let urls = public::rotation(network);
+    if urls.is_empty() {
+        return Err(CoreError::BackendUnavailable(format!(
+            "no public backend exists for {network}; configure your own node"
+        )));
+    }
+    Ok(urls
+        .iter()
+        .map(|url| Endpoint::Esplora((*url).to_owned()))
+        .collect())
+}
+
+/// How long a whole sync attempt against one endpoint may take, every
+/// request together. Each request has a timeout of its own; this bounds
+/// their sum, which a server answering just fast enough to stay under
+/// every one of them would otherwise make endless. Past it the attempt
+/// is abandoned and the next endpoint tried.
+const SCAN_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// Through Tor, where everything is slower.
+const TOR_SCAN_DEADLINE: Duration = Duration::from_secs(20 * 60);
+
+fn scan_deadline(endpoint: &Endpoint) -> Duration {
+    if endpoint.is_onion() {
+        TOR_SCAN_DEADLINE
+    } else {
+        SCAN_DEADLINE
+    }
+}
+
+/// `work`, given up once `deadline` has passed.
+async fn within<T>(
+    deadline: Duration,
+    work: impl Future<Output = Result<T, Fault>>,
+) -> Result<T, Fault> {
+    tokio::time::timeout(deadline, work)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Fault::other(format!(
+                "no answer within {} s",
+                deadline.as_secs()
+            )))
+        })
+}
+
+/// What a sync of a descriptor wallet reads, and what the wallet
+/// already holds: built under the lock of the vault, consumed by one
+/// attempt against one endpoint.
+pub(crate) struct Plan {
+    /// The network of the wallet, whose chain the server's must be.
+    pub network: Network,
+    /// The wallet's chain, which the answer extends.
+    pub tip: CheckPoint,
+    /// The time a transaction seen in the mempool is stamped with.
+    pub start_time: u64,
+    /// Scripts whose history is read.
+    pub scripts: Vec<ScriptBuf>,
+    /// Keychains walked past what the wallet knows, each until
+    /// `stop_gap` scripts in a row show nothing.
+    pub scans: Vec<Scan>,
+    pub stop_gap: u32,
+    /// How an Esplora server is read. Electrum is always read the same
+    /// way: a history is a list of txids, cheaper than any check.
+    pub reading: Reading,
+    pub held: Held,
+    /// What the server of a running live watch announced of each script,
+    /// when this plan runs on that server: an Electrum history that does
+    /// not hash to it, and leaves out what the wallet holds there, is set
+    /// aside ([`electrum::status`]).
+    pub told: Option<electrum::status::Told>,
+}
+
+/// The scripts of one keychain, from the first one to read on.
+pub(crate) struct Scan {
+    pub keychain: KeychainKind,
+    pub spks: Box<dyn Iterator<Item = (u32, ScriptBuf)> + Send>,
+}
+
+/// How much of each script an Esplora server is asked for. Either way
+/// its counters come first, and its history is read, down to what the
+/// wallet holds, only when they differ from what the wallet holds or a
+/// reorganisation moved one of its confirmations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reading {
+    /// And the unconfirmed transactions of a script that has some are
+    /// listed whatever its counters say: a replacement that pays the
+    /// same amount to the same script leaves them as they were.
+    Complete,
+    /// The counters alone.
+    Checked,
+}
+
+/// What the wallet already holds, so that a sync asks the server only
+/// for what it lacks: no transaction twice, no proof of a confirmation
+/// already proven.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    /// Every transaction of the wallet's graph.
+    pub txs: HashMap<Txid, Arc<Transaction>>,
+    /// Where each transaction confirmed in the wallet's best chain sits.
+    pub anchors: HashMap<Txid, ConfirmationBlockTime>,
+    /// Outputs the graph holds without their transaction: the coins the
+    /// wallet's transactions spend from others, fetched once for the fee.
+    pub txouts: HashSet<OutPoint>,
+    /// What the wallet holds for each script it revealed, and each
+    /// script of the plan.
+    pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+    /// Every output of the graph's transactions and every coin it holds
+    /// alone, added up: see [`check_amounts`].
+    pub sats: u64,
+}
+
+impl Held {
+    /// The scripts not in `read` holding a confirmation above
+    /// `agreed_up_to`, in a block the server no longer has: a
+    /// reorganisation moved it, and its script may not have moved with
+    /// it, a transaction mined again at the same height leaving the
+    /// history as it was. A sync reads them whatever its plan, or the
+    /// block it carries would leave that confirmation out of the chain.
+    pub(crate) fn reorganised(
+        &self,
+        agreed_up_to: u32,
+        read: &HashSet<ScriptBuf>,
+    ) -> Vec<ScriptBuf> {
+        let mut moved: Vec<ScriptBuf> = self
+            .scripts
+            .iter()
+            .filter(|(script, _)| !read.contains(*script))
+            .filter(|(_, facts)| {
+                facts.confirmed.iter().any(|txid| {
+                    self.anchors
+                        .get(txid)
+                        .is_some_and(|anchor| anchor.block_id.height > agreed_up_to)
+                })
+            })
+            .map(|(script, _)| script.clone())
+            .collect();
+        moved.sort();
+        moved
+    }
+}
+
+/// What the wallet holds for one script.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ScriptFacts {
+    /// Every transaction of the wallet's view that touches it: a server
+    /// that no longer lists one of them saw it leave the mempool.
+    pub expected: HashSet<Txid>,
+    /// Those among them confirmed in the wallet's best chain.
+    pub confirmed: HashSet<Txid>,
+    /// Its counters, as an Esplora server keeps them.
+    pub counts: esplora::Counts,
+}
+
+/// What one sync attempt brought back.
+pub(crate) struct Synced {
+    pub update: bdk_wallet::Update,
+    /// Set when the wallet's chain holds blocks above the server's tip
+    /// that no server will ever have: far above that tip, or above any
+    /// height a chain can have reached ([`TIP_LAG_MAX`],
+    /// [`height_limit`]). A lying server put them there, once, and an
+    /// update cannot take them out. The blocks above this height are to
+    /// be dropped before the update is applied, which was built as if
+    /// they were gone.
+    pub drop_above: Option<u32>,
+    /// The histories an Electrum server listed, in its order, by script:
+    /// the order its statuses hash them in.
+    pub orders: Vec<(ScriptBuf, Vec<(Txid, i32)>)>,
+    /// A history was set aside unread ([`electrum::status`]): the sync
+    /// did not read every script it was to read.
+    pub set_aside: bool,
+}
+
+/// The most the transactions of one wallet may carry, every output of
+/// each of them and every coin of another they spend added up: past
+/// whatever a wallet ever sees, by millions of times, and short of what
+/// the sums the wallet engine makes, and the signed figures shown from
+/// them, can hold.
+const HELD_MAX_SATS: u64 = i64::MAX as u64;
+
+/// What the outputs of `tx` pay together, when that is no more than the
+/// 21 million bitcoin there will ever be. `None` past it: a consensus
+/// rule every node applies, and each output is within the total.
+pub(crate) fn outputs_within_max_money(tx: &bdk_wallet::bitcoin::Transaction) -> Option<u64> {
+    tx.output
+        .iter()
+        .try_fold(0u64, |sum, out| sum.checked_add(out.value.to_sat()))
+        .filter(|&paid| paid <= bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat())
+}
+
+/// Refuses an update holding amounts no chain can carry: an output, or
+/// the outputs of one transaction together, above the 21 million bitcoin
+/// there will ever be; a transaction that spends one coin twice; or,
+/// with what the wallet holds (`held_sats`, see [`Held::sats`]), more
+/// than [`HELD_MAX_SATS`] in all. Nothing in a block can, but an
+/// unconfirmed transaction is only the server's word, and the wallet
+/// engine adds amounts up with a panic on overflow, across transactions
+/// for a balance and across the coins one spends: once stored, such an
+/// update brought down every later look at the wallet. Each amount it
+/// can add is one of those counted here, once, so none of its sums can
+/// pass the bound.
+pub(crate) fn check_amounts(update: &bdk_wallet::Update, held_sats: u64) -> Result<(), String> {
+    let refused = || "the server sent a transaction worth more than every bitcoin".to_owned();
+    let max_money = bdk_wallet::bitcoin::Amount::MAX_MONEY.to_sat();
+    let mut total = held_sats;
+    for tx in &update.tx_update.txs {
+        let paid = outputs_within_max_money(tx).ok_or_else(refused)?;
+        let mut spent = HashSet::with_capacity(tx.input.len());
+        if !tx
+            .input
+            .iter()
+            .all(|input| spent.insert(input.previous_output))
+        {
+            return Err("the server sent a transaction that spends one coin twice".to_owned());
+        }
+        total = total.saturating_add(paid);
+    }
+    for out in update.tx_update.txouts.values() {
+        if out.value.to_sat() > max_money {
+            return Err(refused());
+        }
+        total = total.saturating_add(out.value.to_sat());
+    }
+    if total > HELD_MAX_SATS {
+        return Err("the server sent more bitcoin than a wallet can hold".to_owned());
+    }
+    Ok(())
+}
+
+/// Runs one sync attempt against one endpoint, within the deadline of
+/// a scan, and refuses an answer whose amounts no chain can carry (see
+/// [`check_amounts`]). The error is the server's failure, its words and
+/// their kind ([`Fault`]): the caller owns retry logic and error
+/// wrapping. Dropping the future abandons the
+/// attempt, an Electrum connection included.
+///
+/// `proxy`, here and below, is the Tor SOCKS proxy the caller resolved
+/// for this operation; `None` when no endpoint of the list is an onion.
+pub(crate) async fn sync_engine(
+    endpoint: &Endpoint,
+    plan: Plan,
+    proxy: Option<&str>,
+) -> Result<Synced, Fault> {
+    let deadline = scan_deadline(endpoint);
+    let held_sats = plan.held.sats;
+    let synced = match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client_for_run(url, proxy)?;
+            within(deadline, esplora::sync::run(&client, plan)).await
+        }
+        Endpoint::Electrum(target) => electrum::sync(target, plan, proxy, deadline).await,
+    }?;
+    check_amounts(&synced.update, held_sats)?;
+    Ok(synced)
+}
+
+/// Fetches the state of a single watched address from one endpoint,
+/// within the deadline of a scan: the same state from an Esplora or an
+/// Electrum server. `held`, what the wallet holds of it, is not read
+/// again where the server lists it as it was. `None` when an Electrum
+/// server listed a history that does not hash to the status it
+/// announced to a running watch (`told`) and leaves out what the wallet
+/// holds: nothing was read.
+pub(crate) async fn fetch_address_state(
+    endpoint: &Endpoint,
+    address: &str,
+    network: Network,
+    proxy: Option<&str>,
+    held: &[crate::wallet::AddressTx],
+    told: Option<&electrum::status::Told>,
+) -> Result<Option<AddressWatchState>, Fault> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client_for_run(url, proxy)?;
+            within(
+                scan_deadline(endpoint),
+                esplora::fetch_address_state(&client, address, network, held),
+            )
+            .await
+            .map(Some)
+        }
+        Endpoint::Electrum(target) => {
+            within(
+                scan_deadline(endpoint),
+                electrum::address::fetch_state(target, address, network, proxy, held, told),
+            )
+            .await
+        }
+    }
+}
+
+// --- what is sent ----------------------------------------------------------
+
+/// Why one endpoint gave no answer to use about a transaction about to
+/// be sent, or being sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Failure {
+    /// Anything but the node's verdict: no connection, a time limit, a
+    /// server error, a rate limit, a server short of memory twice, a
+    /// proxy's page, an answer that is not the protocol, a request the
+    /// server turned away. Nothing was said about the transaction, and
+    /// the next endpoint may be asked. Its kind says whether the server
+    /// itself is down ([`FaultKind::Outage`]).
+    Transport(Fault),
+    /// The node itself turned the transaction down, in these words: a
+    /// verdict recognised as bitcoind's ([`node_verdict`]). That is the
+    /// answer: another operator's node would say the same, and seeing
+    /// the transaction would cost it its privacy for nothing.
+    Refused(String),
+}
+
+/// The node's own words when `message` is bitcoind's verdict on a
+/// transaction handed to it, in one of the forms the server software
+/// that relays `sendrawtransaction` gives it; `None` for anything else,
+/// which is then no refusal of the transaction:
+/// - ElectrumX and Fulcrum: "the transaction was rejected by network
+///   rules.", the node's words on the lines after, the transaction last;
+/// - the electrs of Blockstream, over Electrum and its web API:
+///   "sendrawtransaction RPC error -26: …", the code before the words;
+/// - the electrs of mempool.space: "sendrawtransaction RPC error:
+///   {"code":-26,"message":"…"}";
+/// - electrs (romanz): the node's words alone, under code 2, told by the
+///   reasons bitcoind gives ([`REJECT_REASONS`]).
+///
+/// Of bitcoind's codes, only its verdicts on the transaction count:
+/// -25 (an input missing or spent), -26 (rejected by policy or
+/// consensus), -27 (already in the chain). A node warming up (-28) or one
+/// that cannot be reached is the way there failing.
+pub(crate) fn node_verdict(message: &str) -> Option<String> {
+    const VERDICTS: [i64; 3] = [-25, -26, -27];
+    // A body quoted inside another error arrives with its quotes
+    // escaped: read it as if it were not.
+    let message = &message.replace("\\\"", "\"");
+    let lower = message.to_ascii_lowercase();
+    if let Some(at) = lower.find("rejected by network rules") {
+        // The node's words sit between the sentence and the bracketed
+        // transaction ElectrumX echoes back.
+        let rest = &message[at + "rejected by network rules".len()..];
+        let words = rest
+            .lines()
+            .map(|line| line.trim().trim_start_matches('.').trim())
+            .find(|line| !line.is_empty() && !line.starts_with('['))
+            .unwrap_or("the transaction was rejected by network rules");
+        return Some(server_words(words));
+    }
+    if let Some(at) = lower.find("sendrawtransaction rpc error") {
+        let rest = message[at + "sendrawtransaction rpc error".len()..].trim_start();
+        // mempool.space: the node's error object, after a colon.
+        if let Some(object) = rest.strip_prefix(':').map(str::trim)
+            && let Ok(error) = serde_json::from_str::<serde_json::Value>(object)
+        {
+            let code = error.get("code").and_then(serde_json::Value::as_i64)?;
+            let words = error.get("message").and_then(serde_json::Value::as_str)?;
+            return VERDICTS.contains(&code).then(|| server_words(words));
+        }
+        // Blockstream: the code, a colon, the words.
+        let (code, words) = rest.split_once(':')?;
+        let code: i64 = code.trim().parse().ok()?;
+        return VERDICTS.contains(&code).then(|| server_words(words.trim()));
+    }
+    REJECT_REASONS
+        .iter()
+        .any(|reason| lower.starts_with(reason))
+        .then(|| server_words(message.trim()))
+}
+
+/// How bitcoind's refusals of a transaction begin, its reject reasons and
+/// the messages of its codes -25 to -27, in lower case: what tells the
+/// node's words when a server passes them on bare (electrs, romanz).
+const REJECT_REASONS: &[&str] = &[
+    "min relay fee not met",
+    "mempool min fee not met",
+    "mempool full",
+    "insufficient fee",
+    "bad-txns-",
+    "bad-witness-",
+    "txn-mempool-conflict",
+    "txn-already-in-mempool",
+    "txn-already-known",
+    "txn-same-nonwitness-data-in-mempool",
+    "transaction outputs already in utxo set",
+    "transaction already in block chain",
+    "non-mandatory-script-verify-flag",
+    "mandatory-script-verify-flag-failed",
+    "too-long-mempool-chain",
+    "non-final",
+    "non-bip68-final",
+    "dust",
+    "tx-size",
+    "scriptsig-size",
+    "scriptsig-not-pushonly",
+    "scriptpubkey",
+    "bare-multisig",
+    "multi-op-return",
+    "too many potential replacements",
+    "replacement-adds-unconfirmed",
+    "missing inputs",
+    "missing-inputs",
+    "fee exceeds maximum configured",
+    "unspendable output exceeds maximum configured",
+    "max-fee-exceeded",
+    "absurdly-high-fee",
+];
+
+/// What the endpoints are asked for about a transaction to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose {
+    /// The preview: the coins it spends, whether they are spent, the tip.
+    Preview,
+    /// The broadcast itself.
+    Broadcast,
+}
+
+/// The endpoints asked about a transaction to send, in the order they
+/// are tried. With a live watch on one of the backend's servers, its
+/// operator comes first, the operator that already sees every script
+/// the wallets hold, so the transaction and its inputs go to no other
+/// unless that one stops answering. For a preview, its web API before
+/// its Electrum server: the web API says in one request whether a coin
+/// is spent, and by what. For a broadcast, the server of the watch,
+/// then its operator's web API. The rest after them, in the backend's
+/// order.
+pub(crate) fn send_order(
+    mut endpoints: Vec<Endpoint>,
+    live: Option<Endpoint>,
+    purpose: Purpose,
+) -> Vec<Endpoint> {
+    let Some(live) = live else {
+        return endpoints;
+    };
+    endpoints.retain(|endpoint| *endpoint != live);
+    let live_host = host_of(live.url());
+    let web = endpoints.iter().position(|endpoint| {
+        matches!(endpoint, Endpoint::Esplora(_))
+            && live_host
+                .as_deref()
+                .is_some_and(|host| same_operator(host, &endpoint.label()))
+    });
+    let web = web.map(|position| endpoints.remove(position));
+    let first: Vec<Endpoint> = match (purpose, web) {
+        (Purpose::Preview, Some(web)) => vec![web, live],
+        (Purpose::Broadcast, Some(web)) => vec![live, web],
+        (_, None) => vec![live],
+    };
+    endpoints.splice(0..0, first);
+    endpoints
+}
+
+/// Whether a host belongs to the operator whose web API is at
+/// `operator`: the same host, or one under it
+/// (`electrum.blockstream.info` and `blockstream.info`). The one rule
+/// for it: the live watch picks its servers by it too, and their
+/// siblings (`watch::servers_for`, `watch::electrum::siblings`).
+pub(crate) fn same_operator(host: &str, operator: &str) -> bool {
+    host == operator || host.ends_with(&format!(".{operator}"))
+}
+
+/// Whether a node's refusal says it already holds the transaction: in
+/// its mempool (`txn-already-in-mempool`, `txn-already-known`, "already
+/// known") or in a block ("Transaction outputs already in utxo set",
+/// "Transaction already in block chain"). A broadcast that hears this
+/// was not refused: the same server is asked for the transaction.
+pub(crate) fn already_known(words: &str) -> bool {
+    let words = words.to_ascii_lowercase();
+    [
+        "already known",
+        "txn-already-known",
+        "txn-already-in-mempool",
+        "already in utxo set",
+        "already in block chain",
+    ]
+    .iter()
+    .any(|phrase| words.contains(phrase))
+}
+
+/// Hands a signed transaction to one endpoint. Sent means the server
+/// answered with the txid the transaction hashes to; another txid is a
+/// failure. A node that says it already holds the transaction did not
+/// refuse it when the same server hands it over, hashing to that txid.
+pub(crate) async fn broadcast(
+    endpoint: &Endpoint,
+    tx: &Transaction,
+    proxy: Option<&str>,
+) -> Result<(), Failure> {
+    let txid = tx.compute_txid();
+    let answered = match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
+            esplora::broadcast(&client, tx).await
+        }
+        Endpoint::Electrum(target) => electrum::broadcast(target, tx, proxy).await,
+    };
+    match answered {
+        Ok(answered) if answered == txid => Ok(()),
+        // No verdict of the node's: a server that says it took another
+        // transaction has not said it took this one.
+        Ok(answered) => Err(Failure::Transport(Fault::other(format!(
+            "the server answered with the txid {answered}, not {txid}"
+        )))),
+        // The node says it holds it already. The same server is asked for
+        // it: handed over, it is the transaction; not there, the server's
+        // index may not have caught up with its node, whose word stands.
+        // A server that cannot be reached is no answer, and another
+        // transaction under that txid is no answer either.
+        Err(Failure::Refused(words)) if already_known(&words) => {
+            match fetch_tx(endpoint, txid, proxy).await {
+                Ok(Some(held)) if held.compute_txid() == txid => Ok(()),
+                Ok(Some(_)) => Err(Failure::Transport(Fault::other(format!(
+                    "the server handed over another transaction as {txid}"
+                )))),
+                Ok(None) => Ok(()),
+                Err(failure) => Err(failure),
+            }
+        }
+        Err(failure) => Err(failure),
+    }
+}
+
+/// The transaction `txid` as one endpoint holds it, `None` when it does
+/// not: the caller checks what it hashes to.
+async fn fetch_tx(
+    endpoint: &Endpoint,
+    txid: Txid,
+    proxy: Option<&str>,
+) -> Result<Option<Transaction>, Failure> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy).map_err(Failure::Transport)?;
+            client.tx(&txid).await.map_err(Failure::Transport)
+        }
+        Endpoint::Electrum(target) => electrum::fetch_tx(target, txid, proxy).await,
+    }
+}
+
+/// What a server's certificate amounts to, for a settings screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CertificateStatus {
+    /// Plain TCP: there is no certificate, and anything on the path
+    /// reads the traffic.
+    NotTls,
+    /// A Tor hidden service: the onion address is the server's identity,
+    /// so no certificate has to vouch for it.
+    Tor,
+    /// A public certificate authority vouches for it.
+    Trusted,
+    /// It is exactly the certificate accepted for this host.
+    Pinned { fingerprint: String },
+    /// No authority vouches for it and this host has no accepted
+    /// certificate yet: the user decides, once, with what the
+    /// certificate says about itself in front of them.
+    Unknown {
+        fingerprint: String,
+        reason: String,
+        subject: Option<String>,
+        expires: Option<i64>,
+    },
+    /// This host was accepted with a different certificate. Something
+    /// changed on the server, or something sits in between.
+    Changed { stored: String, presented: String },
+    /// The server could not be reached, so nothing can be said about
+    /// its certificate.
+    Unreachable { detail: String },
+}
+
+/// One server's certificate, and where it is stored from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificateReport {
+    /// `host:port`: what the acceptance is recorded against.
+    pub host: String,
+    #[serde(flatten)]
+    pub status: CertificateStatus,
+}
+
+/// What the settings screen should say about an Electrum server's
+/// certificate, and the fingerprint to offer for acceptance.
+pub(crate) async fn inspect_certificate(
+    url: String,
+    pin: Option<String>,
+) -> Result<electrum::Inspection, String> {
+    electrum::inspect(&electrum::Target::new(url, pin)).await
+}
+
+/// The output an outpoint names, in the transaction a server returned
+/// for its txid. The txid commits to every output, so a transaction
+/// that does not hash to it is the server's invention, refused rather
+/// than read for the value and the fee the preview shows.
+pub(crate) fn output_at(tx: &Transaction, outpoint: OutPoint) -> Result<Option<TxOut>, Fault> {
+    if tx.compute_txid() != outpoint.txid {
+        return Err(Fault::other(
+            "the server answered with another transaction than the one asked for",
+        ));
+    }
+    Ok(tx.output.get(outpoint.vout as usize).cloned())
+}
+
+/// Whether `tx`, which a server handed over as `txid`, is that
+/// transaction and spends `outpoint`: what makes a server's word that a
+/// coin is spent more than its word.
+pub(crate) fn spends(tx: &Transaction, txid: Txid, outpoint: OutPoint) -> bool {
+    tx.compute_txid() == txid
+        && tx
+            .input
+            .iter()
+            .any(|input| input.previous_output == outpoint)
+}
+
+/// What one endpoint knows about a coin about to be spent.
+pub(crate) struct PrevoutFacts {
+    pub txout: Option<TxOut>,
+    /// `None` when the endpoint cannot say.
+    pub spent: Option<bool>,
+    /// The transaction that spends it, when the endpoint names it.
+    pub spent_by: Option<crate::broadcast::SpentBy>,
+}
+
+/// What one endpoint knows about the coins at `outpoints`, asked in turn
+/// over one connection (one HTTP client, one Electrum session): the facts
+/// of the coins it answered about, in order, and the failure that stopped
+/// it before the rest, if one did. A failure is never the node's verdict
+/// here: those coins go to the next endpoint.
+pub(crate) async fn fetch_prevouts(
+    endpoint: &Endpoint,
+    outpoints: &[OutPoint],
+    proxy: Option<&str>,
+) -> (Vec<PrevoutFacts>, Option<Failure>) {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = match esplora::client(url, proxy) {
+                Ok(client) => client,
+                Err(text) => return (Vec::new(), Some(Failure::Transport(text))),
+            };
+            let mut facts = Vec::with_capacity(outpoints.len());
+            for outpoint in outpoints {
+                match esplora::fetch_prevout(&client, *outpoint).await {
+                    Ok(fact) => facts.push(PrevoutFacts {
+                        txout: fact.txout,
+                        spent: fact.spent,
+                        spent_by: fact.spent_by,
+                    }),
+                    Err(failure) => return (facts, Some(failure)),
+                }
+            }
+            (facts, None)
+        }
+        Endpoint::Electrum(target) => {
+            electrum::fetch_prevouts(target, outpoints.to_vec(), proxy).await
+        }
+    }
+}
+
+/// The height of the endpoint's tip: the one a time lock is judged
+/// against when the transaction reaches that node.
+pub(crate) async fn tip_height(endpoint: &Endpoint, proxy: Option<&str>) -> Result<u32, Failure> {
+    match endpoint {
+        Endpoint::Esplora(url) => esplora::client(url, proxy)
+            .map_err(Failure::Transport)?
+            .height()
+            .await
+            .map_err(Failure::Transport),
+        Endpoint::Electrum(target) => electrum::tip_height(target, proxy).await,
+    }
+}
+
+/// The output scripts of a transaction an Electrum server can be asked
+/// for it through, in the order they are tried: the ones a coin may sit
+/// on first, an OP_RETURN, whose history only says who else wrote one,
+/// last, and four at most, each once.
+pub(crate) fn lookup_scripts(tx: &Transaction) -> Vec<ScriptBuf> {
+    let mut scripts: Vec<ScriptBuf> = Vec::new();
+    let (data, coins): (Vec<&TxOut>, Vec<&TxOut>) = tx
+        .output
+        .iter()
+        .partition(|output| output.script_pubkey.is_op_return());
+    for output in coins.into_iter().chain(data) {
+        if !scripts.contains(&output.script_pubkey) {
+            scripts.push(output.script_pubkey.clone());
+        }
+    }
+    scripts.truncate(4);
+    scripts
+}
+
+/// Where a transaction stands at one endpoint. `scripts` are output
+/// scripts of the transaction, the handle Electrum needs: see
+/// [`lookup_scripts`].
+pub(crate) struct TxStanding {
+    pub found: bool,
+    pub block_height: Option<u32>,
+    pub tip_height: u32,
+}
+
+pub(crate) async fn tx_standing(
+    endpoint: &Endpoint,
+    network: Network,
+    txid: Txid,
+    scripts: Vec<ScriptBuf>,
+    proxy: Option<&str>,
+) -> Result<TxStanding, Fault> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client(url, proxy)?;
+            let standing = esplora::tx_standing(&client, network, &txid).await?;
+            Ok(TxStanding {
+                found: standing.found,
+                block_height: standing
+                    .confirmed
+                    .then_some(standing.block_height)
+                    .flatten(),
+                tip_height: standing.tip_height,
+            })
+        }
+        Endpoint::Electrum(target) => {
+            let (found, block_height, tip_height) =
+                electrum::tx_standing(target, network, txid, scripts, proxy).await?;
+            Ok(TxStanding {
+                found,
+                block_height,
+                tip_height,
+            })
+        }
+    }
+}
+
+/// Fetches an older round of address history from one endpoint.
+pub(crate) async fn fetch_address_history(
+    endpoint: &Endpoint,
+    address: &str,
+    network: Network,
+    from: &str,
+    proxy: Option<&str>,
+) -> Result<esplora::HistoryRound, Fault> {
+    match endpoint {
+        Endpoint::Esplora(url) => {
+            let client = esplora::client_for_run(url, proxy)?;
+            within(
+                scan_deadline(endpoint),
+                esplora::fetch_address_history(&client, address, network, from),
+            )
+            .await
+        }
+        Endpoint::Electrum(target) => {
+            within(
+                scan_deadline(endpoint),
+                electrum::address::fetch_history(target, address, network, from, proxy),
+            )
+            .await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What tells a client that reads the environment's proxy from one
+    /// that does not, whatever this machine's environment holds.
+    #[test]
+    fn a_client_built_for_the_core_takes_no_proxy_of_its_own() {
+        assert!(
+            takes_a_proxy(&reqwest::Client::new()),
+            "reqwest's default does"
+        );
+        assert!(!takes_a_proxy(&http_client().build().unwrap()));
+    }
+
+    /// A hidden service is one whatever case its name was read in: a QR
+    /// code prints capitals, and a `.ONION` taken for a clearnet host
+    /// would be looked up and reached outside Tor.
+    #[test]
+    fn an_onion_host_is_one_in_any_case() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        assert!(is_onion(&format!("tcp://{ONION}.onion:50001")));
+        assert!(is_onion(&format!(
+            "tcp://{}.ONION:50001",
+            ONION.to_ascii_uppercase()
+        )));
+        assert!(is_onion(&format!("http://{ONION}.Onion/api")));
+        assert!(!is_onion("ssl://electrum.example.org:50002"));
+        assert!(!is_onion("ssl://onion.example.org:50002"));
+        // Nothing a camera decodes may panic the check.
+        assert!(!is_onion_host("a\u{e9}\u{e9}\u{e9}\u{e9}"));
+        assert!(!is_onion_host("\u{e9}\u{e9}"));
+        assert!(is_onion_host("\u{e9}.onion"));
+        assert!(needs_tor(&[Endpoint::Electrum(electrum::Target::new(
+            format!("tcp://{}.ONION:50001", ONION.to_ascii_uppercase()),
+            None
+        ))]));
+    }
+
+    /// A fragment glued to the name is not part of the host, and the
+    /// backend parser already reads it that way: an onion followed by
+    /// `#` must not be taken for a clearnet host and reached outside Tor.
+    #[test]
+    fn a_fragment_does_not_hide_an_onion_host() {
+        assert!(is_onion("http://abc.onion#frag"));
+        assert!(is_onion("http://abc.onion?q"));
+        assert_eq!(
+            host_of("http://abc.onion#frag").as_deref(),
+            Some("abc.onion")
+        );
+        assert!(needs_tor(&[Endpoint::Esplora(
+            "http://abc.onion#frag".to_owned()
+        )]));
+    }
+
+    /// The host is read with the parser the HTTP client reads with, so
+    /// a disguised onion goes through Tor and a disguised clearnet host
+    /// does not: the two never mean different machines.
+    #[test]
+    fn a_host_is_read_the_way_the_client_connects_to_it() {
+        // Under a standard scheme a backslash ends the host: the client
+        // would reach evil.com, in the clear, with `/.onion` as a path.
+        assert_eq!(
+            host_of("https://evil.com\\.onion").as_deref(),
+            Some("evil.com")
+        );
+        assert!(!is_onion("https://evil.com\\.onion"));
+        // A percent-encoded dot is a dot to the client: an onion, and
+        // one that must never reach a resolver.
+        assert_eq!(
+            host_of("https://evil%2Eonion").as_deref(),
+            Some("evil.onion")
+        );
+        assert!(is_onion("https://evil%2Eonion"));
+        assert!(is_onion("https://EVIL%2eONION/api"));
+        // A fully qualified name is the same name.
+        assert_eq!(host_of("https://x.onion.").as_deref(), Some("x.onion"));
+        assert!(is_onion("https://x.onion."));
+        assert!(is_onion_host("X.ONION."));
+        // The userinfo is not the host, whatever it holds.
+        assert_eq!(
+            host_and_port("https://user:Pass@Host.Example:3002/api"),
+            Some(("host.example".to_owned(), Some(3002)))
+        );
+        assert_eq!(
+            host_of("https://x.onion@evil.com/").as_deref(),
+            Some("evil.com")
+        );
+        assert!(!is_onion("https://x.onion@evil.com/"));
+
+        // The Electrum schemes, and a bare address, read the same way.
+        assert_eq!(
+            host_and_port("ssl://xxx.onion:50002"),
+            Some(("xxx.onion".to_owned(), Some(50002)))
+        );
+        assert!(is_onion("ssl://xxx.onion:50002"));
+        assert_eq!(
+            host_and_port("tcp://XXX%2Eonion:50001"),
+            Some(("xxx.onion".to_owned(), Some(50001)))
+        );
+        assert!(is_onion("tcp://XXX%2Eonion:50001"));
+        assert!(is_onion("tcp://xxx.onion.:50001"));
+        assert_eq!(
+            host_and_port("node.example:50001"),
+            Some(("node.example".to_owned(), Some(50001)))
+        );
+        assert_eq!(
+            host_and_port("ssl://user:pass@node.example"),
+            Some(("node.example".to_owned(), None))
+        );
+        // Under a scheme the standard does not know a backslash is not
+        // a character a host may hold: there is no host to name, and
+        // nothing to route through Tor.
+        assert_eq!(host_of("ssl://evil.com\\.onion:50002"), None);
+        assert!(!is_onion("ssl://evil.com\\.onion:50002"));
+
+        // An IPv6 literal, bracketed on the way in, bare on the way out.
+        assert_eq!(
+            host_and_port("ssl://[2001:DB8::1]:50002"),
+            Some(("2001:db8::1".to_owned(), Some(50002)))
+        );
+        assert_eq!(
+            host_and_port("https://[::1]:3002/api"),
+            Some(("::1".to_owned(), Some(3002)))
+        );
+
+        // Nothing to connect to.
+        assert_eq!(host_of("https://"), None);
+        assert_eq!(host_of("ssl://:50002"), None);
+        assert_eq!(host_of("https://host name/"), None);
+        assert_eq!(host_of(""), None);
+    }
+
+    /// A key names the protocol, the host and the port, and nothing a
+    /// URL may carry besides.
+    #[test]
+    fn keys_tell_the_servers_of_one_host_apart() {
+        let electrum = |url: &str| Endpoint::Electrum(electrum::Target::new(url, None));
+        let esplora = |url: &str| Endpoint::Esplora(url.to_owned());
+        assert_eq!(
+            electrum("ssl://blockstream.info:700").key(),
+            "electrum blockstream.info 700"
+        );
+        assert_eq!(
+            esplora("https://blockstream.info/api").key(),
+            "esplora blockstream.info"
+        );
+        assert_eq!(
+            esplora("http://user:pass@Node.Example.org:3002/api").key(),
+            "esplora node.example.org 3002"
+        );
+        assert_ne!(
+            esplora("http://node.example.org:3002/api").key(),
+            electrum("tcp://node.example.org:50001").key()
+        );
+    }
+
+    #[test]
+    fn labels_are_hosts_only() {
+        assert_eq!(
+            BackendConfig::default().label(Network::Mainnet),
+            "mempool.space"
+        );
+        assert_eq!(
+            BackendConfig::CustomEsplora {
+                url: "https://user:pass@node.example.org:3002/api".to_owned(),
+                own_node: false,
+            }
+            .label(Network::Mainnet),
+            "node.example.org"
+        );
+        assert_eq!(
+            BackendConfig::CustomElectrum {
+                url: "ssl://fulcrum.example.org:50002".to_owned(),
+                own_node: false,
+            }
+            .label(Network::Signet),
+            "fulcrum.example.org"
+        );
+        assert_eq!(
+            BackendConfig::Public {
+                server: Some("electrum:electrum.blockstream.info".to_owned())
+            }
+            .label(Network::Mainnet),
+            "electrum.blockstream.info:50002"
+        );
+    }
+
+    /// Vaults written before the operator choice existed carry a bare
+    /// `{"type":"public_esplora"}`, and must keep reading and writing
+    /// that exact shape while nothing is chosen.
+    #[test]
+    fn the_automatic_public_backend_keeps_its_stored_shape() {
+        let stored: BackendConfig = serde_json::from_str(r#"{"type":"public_esplora"}"#).unwrap();
+        assert_eq!(stored, BackendConfig::default());
+        assert_eq!(
+            serde_json::to_string(&stored).unwrap(),
+            r#"{"type":"public_esplora"}"#
+        );
+        let chosen = BackendConfig::Public {
+            server: Some("blockstream.info".to_owned()),
+        };
+        assert_eq!(
+            serde_json::to_string(&chosen).unwrap(),
+            r#"{"type":"public_esplora","server":"blockstream.info"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<BackendConfig>(
+                r#"{"type":"public_esplora","server":"blockstream.info"}"#
+            )
+            .unwrap(),
+            chosen
+        );
+    }
+
+    /// A custom backend stored before the switch existed reads as a
+    /// server that is not the user's node, and writes back byte for
+    /// byte; the switch shows in the stored form only once turned on,
+    /// and the canonical form keeps it.
+    #[test]
+    fn the_own_node_switch_is_stored_only_when_on() {
+        for stored in [
+            r#"{"type":"custom_electrum","url":"ssl://node.example.org:50002"}"#,
+            r#"{"type":"custom_esplora","url":"https://node.example.org/api"}"#,
+        ] {
+            let config: BackendConfig = serde_json::from_str(stored).unwrap();
+            assert!(!config.is_own_node());
+            assert_eq!(serde_json::to_string(&config).unwrap(), stored);
+        }
+        let own = BackendConfig::CustomElectrum {
+            url: "Node.Example.ORG.:50002".to_owned(),
+            own_node: true,
+        };
+        assert!(own.is_own_node());
+        let canonical = own.canonical().unwrap();
+        assert_eq!(
+            serde_json::to_string(&canonical).unwrap(),
+            r#"{"type":"custom_electrum","url":"ssl://node.example.org:50002","own_node":true}"#
+        );
+        let esplora: BackendConfig = serde_json::from_str(
+            r#"{"type":"custom_esplora","url":"https://node.example.org/api","own_node":true}"#,
+        )
+        .unwrap();
+        assert!(esplora.is_own_node());
+        // The public backend has no such switch, whatever a stored form
+        // says.
+        let public: BackendConfig =
+            serde_json::from_str(r#"{"type":"public_esplora","own_node":true}"#).unwrap();
+        assert_eq!(public, BackendConfig::default());
+        assert!(!public.is_own_node());
+    }
+
+    #[test]
+    fn a_chosen_operator_is_the_only_endpoint() {
+        let none = TrustedCerts::new();
+        let esplora = BackendConfig::Public {
+            server: Some("mempool.emzy.de".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&esplora, Network::Testnet4, &none).unwrap(),
+            vec![Endpoint::Esplora(
+                "https://mempool.emzy.de/testnet4/api".to_owned()
+            )]
+        );
+        let electrum = BackendConfig::Public {
+            server: Some("electrum:blackie.c3-soft.com".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&electrum, Network::Testnet4, &none).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://blackie.c3-soft.com:57010",
+                None
+            ))]
+        );
+    }
+
+    /// The fingerprint the user accepted travels with the endpoint,
+    /// whether the server comes from the catalogue or from their own
+    /// configuration, and however they spelled the address.
+    #[test]
+    fn an_accepted_certificate_reaches_the_endpoint() {
+        let mut certs = TrustedCerts::new();
+        certs.insert(
+            "blackie.c3-soft.com:57010".to_owned(),
+            "AA:BB".repeat(16).trim_end_matches(':').to_owned(),
+        );
+        let pinned = certs.values().next().cloned();
+        let catalogue = BackendConfig::Public {
+            server: Some("electrum:blackie.c3-soft.com".to_owned()),
+        };
+        assert_eq!(
+            endpoints(&catalogue, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://blackie.c3-soft.com:57010",
+                pinned.clone()
+            ))]
+        );
+        let own = BackendConfig::CustomElectrum {
+            url: "blackie.c3-soft.com:57010".to_owned(),
+            own_node: false,
+        };
+        // Read in the form the settings store, the fingerprint with it.
+        assert_eq!(
+            endpoints(&own, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://blackie.c3-soft.com:57010",
+                pinned
+            ))]
+        );
+        // A server with nothing accepted for it carries no fingerprint.
+        let other = BackendConfig::CustomElectrum {
+            url: "ssl://elsewhere.example:50002".to_owned(),
+            own_node: false,
+        };
+        assert_eq!(
+            endpoints(&other, Network::Testnet4, &certs).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://elsewhere.example:50002",
+                None
+            ))]
+        );
+    }
+
+    /// A vault written before custom addresses were stored in canonical
+    /// form still holds them as typed. They are read in that form on
+    /// the way to a connection, and one that has none is refused before
+    /// anything connects: to the URL parser `tcp://x.onion:50001:extra`
+    /// names no host, so no onion, and the resolver would see the name.
+    #[test]
+    fn a_stored_address_is_read_in_canonical_form() {
+        let none = TrustedCerts::new();
+        let electrum = BackendConfig::CustomElectrum {
+            url: "Node.Example.ORG.:50002".to_owned(),
+            own_node: false,
+        };
+        assert_eq!(
+            endpoints(&electrum, Network::Signet, &none).unwrap(),
+            vec![Endpoint::Electrum(electrum::Target::new(
+                "ssl://node.example.org:50002",
+                None
+            ))]
+        );
+        let esplora = BackendConfig::CustomEsplora {
+            url: "HTTPS://Esplora.Example.ORG./api/".to_owned(),
+            own_node: false,
+        };
+        assert_eq!(
+            endpoints(&esplora, Network::Signet, &none).unwrap(),
+            vec![Endpoint::Esplora(
+                "https://esplora.example.org/api".to_owned()
+            )]
+        );
+        for unreadable in [
+            BackendConfig::CustomElectrum {
+                url: "tcp://x.onion:50001:extra".to_owned(),
+                own_node: false,
+            },
+            BackendConfig::CustomEsplora {
+                url: "x.onion/api".to_owned(),
+                own_node: false,
+            },
+        ] {
+            assert!(
+                matches!(
+                    endpoints(&unreadable, Network::Signet, &none),
+                    Err(CoreError::InvalidInput { kind: "server", .. })
+                ),
+                "{unreadable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_and_unknown_operators_rotate_over_every_instance() {
+        let none = TrustedCerts::new();
+        let automatic = endpoints(&BackendConfig::default(), Network::Mainnet, &none).unwrap();
+        assert_eq!(automatic.len(), 3);
+        // An identifier no build knew, and one a later build dropped:
+        // `frigate.2140.dev`, a Silent Payments server that hands every
+        // other request to an Electrum server behind it.
+        for gone in ["gone.example.org", "electrum:frigate.2140.dev"] {
+            let retired = BackendConfig::Public {
+                server: Some(gone.to_owned()),
+            };
+            assert_eq!(
+                endpoints(&retired, Network::Mainnet, &none).unwrap(),
+                automatic,
+                "{gone}"
+            );
+        }
+        // A network without a public instance still says so.
+        assert!(endpoints(&BackendConfig::default(), Network::Regtest, &none).is_err());
+    }
+
+    /// A server may say anything about a transaction still out of a
+    /// block. One that sums past every bitcoin is refused before the
+    /// wallet engine, which would panic adding it up at every look.
+    #[test]
+    fn a_response_worth_more_than_every_bitcoin_is_refused() {
+        use bdk_wallet::bitcoin::{Amount, absolute, transaction};
+        use std::sync::Arc;
+        let tx = |values: &[u64]| {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: values
+                    .iter()
+                    .map(|&value| TxOut {
+                        value: Amount::from_sat(value),
+                        script_pubkey: ScriptBuf::new(),
+                    })
+                    .collect(),
+            })
+        };
+        let full = |txs: Vec<Arc<Transaction>>, txouts: Vec<u64>| {
+            let mut update = bdk_wallet::Update::default();
+            update.tx_update.txs = txs;
+            update.tx_update.txouts = txouts
+                .into_iter()
+                .enumerate()
+                .map(|(vout, value)| {
+                    (
+                        OutPoint::new(Txid::from_byte_array([7; 32]), vout as u32),
+                        TxOut {
+                            value: Amount::from_sat(value),
+                            script_pubkey: ScriptBuf::new(),
+                        },
+                    )
+                })
+                .collect();
+            update
+        };
+        let max = Amount::MAX_MONEY.to_sat();
+        use bdk_wallet::bitcoin::hashes::Hash;
+
+        assert!(check_amounts(&full(vec![tx(&[max])], vec![max]), 0).is_ok());
+        for update in [
+            full(vec![tx(&[1 << 63, 1 << 63])], Vec::new()),
+            full(vec![tx(&[max, 1])], Vec::new()),
+            full(Vec::new(), vec![max + 1]),
+        ] {
+            assert!(check_amounts(&update, 0).is_err());
+        }
+    }
+
+    /// Each transaction within the bound, and thousands of them paying
+    /// every bitcoin there is, all unconfirmed: the wallet engine would
+    /// add them up into a balance and panic. Refused, whether the excess
+    /// comes from the answer alone or from the answer and what the wallet
+    /// holds already; so is a transaction spending one coin twice, whose
+    /// spent amount the engine adds up as many times.
+    #[test]
+    fn a_response_whose_sums_overflow_is_refused() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{Amount, Sequence, TxIn, Witness, absolute, transaction};
+        use std::sync::Arc;
+        let max = Amount::MAX_MONEY;
+        let paying = |n: u32, inputs: Vec<OutPoint>| {
+            Arc::new(Transaction {
+                version: transaction::Version::TWO,
+                lock_time: absolute::LockTime::from_consensus(n),
+                input: inputs
+                    .into_iter()
+                    .map(|previous_output| TxIn {
+                        previous_output,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    })
+                    .collect(),
+                output: vec![TxOut {
+                    value: max,
+                    script_pubkey: ScriptBuf::new(),
+                }],
+            })
+        };
+        let flood = |count: u32| {
+            let mut update = bdk_wallet::Update::default();
+            update.tx_update.txs = (0..count).map(|n| paying(n, Vec::new())).collect();
+            update
+        };
+        assert!(check_amounts(&flood(9_000), 0).is_err());
+        assert!(check_amounts(&flood(10), 0).is_ok());
+        // Within the bound alone, past it with what the wallet holds.
+        assert!(check_amounts(&flood(10), HELD_MAX_SATS - max.to_sat()).is_err());
+        assert!(check_amounts(&flood(1), HELD_MAX_SATS - max.to_sat()).is_ok());
+        // The coins of others an answer brings count too.
+        let mut coins = bdk_wallet::Update::default();
+        coins.tx_update.txouts = (0..9_000u32)
+            .map(|vout| {
+                (
+                    OutPoint::new(Txid::from_byte_array([7; 32]), vout),
+                    TxOut {
+                        value: max,
+                        script_pubkey: ScriptBuf::new(),
+                    },
+                )
+            })
+            .collect();
+        assert!(check_amounts(&coins, 0).is_err());
+
+        let coin = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+        let mut twice = bdk_wallet::Update::default();
+        twice.tx_update.txs = vec![paying(0, vec![coin, coin])];
+        assert_eq!(
+            check_amounts(&twice, 0).unwrap_err(),
+            "the server sent a transaction that spends one coin twice"
+        );
+        twice.tx_update.txs = vec![paying(0, vec![coin, OutPoint { vout: 1, ..coin }])];
+        assert!(check_amounts(&twice, 0).is_ok());
+    }
+
+    /// A server down, or asking for less, is an outage; a refusal of what
+    /// was asked is not, whatever words the server put in it, unless it
+    /// turned the request down for want of memory. Nor is a server that
+    /// lies, nor what the core says of an answer it would not take.
+    #[test]
+    fn an_outage_is_told_from_a_refused_request() {
+        use electrum::rpc::CallError;
+        let changed = tls::ConnectError::Certificate(tls::Verdict::Changed {
+            stored: "AA".to_owned(),
+            presented: "BB".to_owned(),
+        });
+        assert!(Fault::from(changed.clone()).is_outage(), "{changed}");
+        let busy = Fault::from(CallError::Refused {
+            words: "response budget exhausted, retry later".to_owned(),
+            busy: true,
+        });
+        assert!(busy.is_outage(), "{busy}");
+        // The words of a refusal choose nothing, those of an outage or of
+        // a false proof included.
+        for words in [
+            "history too large",
+            "request timed out",
+            "could not connect",
+            "HTTP 503: server error",
+            "response budget exhausted, retry later",
+            proof::FALSE_PROOF,
+            proof::COIN_NOT_PAID,
+            proof::UNPROVEN_REORGANISATION,
+        ] {
+            let refused = Fault::from(CallError::refused(words));
+            assert_eq!(refused.kind(), FaultKind::Other, "{refused}");
+        }
+        for said in [
+            "no answer within 600 s",
+            "the connection ended unexpectedly",
+            "request failed",
+            "unexpected response",
+            ANOTHER_NETWORK,
+            IMPOSSIBLE_TIP,
+            "the history of this address changed since the last sync; sync the wallet and try again",
+        ] {
+            assert_eq!(
+                Fault::from(said.to_owned()).kind(),
+                FaultKind::Other,
+                "{said}"
+            );
+        }
+        assert!(Fault::false_proof().is_false_proof());
+        assert!(Fault::coin_not_paid().is_false_proof());
+        assert!(Fault::unproven_reorganisation().is_false_proof());
+        assert_eq!(Fault::false_proof(), proof::FALSE_PROOF);
+        assert_eq!(Fault::coin_not_paid(), proof::COIN_NOT_PAID);
+        assert_eq!(
+            Fault::unproven_reorganisation(),
+            proof::UNPROVEN_REORGANISATION
+        );
+    }
+
+    /// The highest tip a chain can have is far past the real one, with
+    /// room for a clock that is wrong, and far short of four billion.
+    #[test]
+    fn a_tip_is_bounded_by_the_clock() {
+        let now = 1_790_812_800 + 365 * 24 * 3600;
+        for network in [Network::Mainnet, Network::Signet, Network::Testnet4] {
+            let limit = height_limit(network, now);
+            assert!(limit > 1_000_000, "{network}: {limit}");
+            assert!(limit < 20_000_000, "{network}: {limit}");
+            // A clock set back to 1970 is not believed over the code.
+            assert!(height_limit(network, 0) > 1_000_000, "{network}");
+        }
+        assert_eq!(height_limit(Network::Regtest, now), u32::MAX);
+    }
+
+    /// A mainnet header is held to the work its target asks for; a signet
+    /// one, made valid by a signature, is not.
+    #[test]
+    fn a_header_no_one_mined_has_no_work() {
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        let genesis = genesis_block(bdk_wallet::bitcoin::Network::Bitcoin).header;
+        assert!(has_proof_of_work(Network::Mainnet, 0, &genesis));
+        let unmined = bdk_wallet::bitcoin::block::Header {
+            nonce: genesis.nonce.wrapping_add(1),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Mainnet, 0, &unmined));
+        // The easiest target there is, on a network that asks for more.
+        let easy = bdk_wallet::bitcoin::block::Header {
+            bits: bdk_wallet::bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+            ..genesis
+        };
+        assert!(!has_proof_of_work(Network::Testnet4, 0, &easy));
+        assert!(has_proof_of_work(Network::Signet, 0, &unmined));
+    }
+
+    /// A descriptor wallet on signet whose backend is `backend`, synced
+    /// once.
+    async fn synced_wallet(
+        dir: &std::path::Path,
+        backend: BackendConfig,
+    ) -> (crate::WalletManager, String) {
+        const WALLET: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        let manager =
+            crate::WalletManager::open(dir, crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager.set_backend(Network::Signet, backend).await.unwrap();
+        let parsed = crate::input::parse_input(WALLET).unwrap();
+        let wallet = manager
+            .add_wallet("Watched", &parsed, Network::Signet)
+            .await
+            .unwrap();
+        manager.sync_wallet(&wallet.id).await.unwrap();
+        (manager, wallet.id)
+    }
+
+    /// An Electrum tip is held to the work of its height, with no request
+    /// more: the genesis header is a tip at height 0, and no tip at all
+    /// a few hundred thousand blocks on.
+    #[test]
+    fn an_electrum_tip_carries_the_work_of_its_height() {
+        let genesis =
+            bdk_wallet::bitcoin::constants::genesis_block(Network::Mainnet.to_bitcoin()).header;
+        assert_eq!(checked_tip(Network::Mainnet, 0, &genesis), Ok(0));
+        assert_eq!(
+            checked_tip(Network::Mainnet, 900_000, &genesis).unwrap_err(),
+            UNWORKED_TIP
+        );
+        assert_eq!(
+            checked_tip(Network::Mainnet, 4_000_000_000, &genesis).unwrap_err(),
+            IMPOSSIBLE_TIP
+        );
+        assert_eq!(checked_tip(Network::Signet, 900_000, &genesis), Ok(900_000));
+    }
+
+    /// A tip of four billion, from either kind of server, is refused,
+    /// and the wallet syncs as before once the server stops lying.
+    #[tokio::test]
+    async fn a_tip_no_chain_has_reached_is_refused() {
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), electrum.backend()).await;
+        electrum.state.lock().unwrap().height = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        electrum.state.lock().unwrap().height = 100;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 100);
+
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (manager, wallet) = synced_wallet(dir.path(), esplora.backend()).await;
+        esplora.state.lock().unwrap().tip = 4_000_000_000;
+        let refused = manager.sync_wallet(&wallet).await.unwrap_err().to_string();
+        assert!(refused.contains(IMPOSSIBLE_TIP), "{refused}");
+        esplora.state.lock().unwrap().tip = 500;
+        assert_eq!(manager.sync_wallet(&wallet).await.unwrap().tip_height, 500);
+    }
+
+    /// A block a lying server once put in a wallet's chain, far above
+    /// any real tip, is stored with it. No update can take it out, and
+    /// every Esplora sync failed on it for good. The next sync, on an
+    /// honest server of either kind, drops it, and the wallet's chain
+    /// is back on the server's, in the vault too.
+    #[tokio::test]
+    async fn a_block_a_lying_server_left_is_dropped() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        let forged = bdk_wallet::chain::BlockId {
+            height: 4_000_000_000,
+            hash: bdk_wallet::bitcoin::BlockHash::from_byte_array([0xee; 32]),
+        };
+        let electrum = crate::testkit::FakeElectrum::start().await;
+        let esplora = crate::testkit::FakeMempool::start(false, 0).await;
+        for (backend, honest) in [(electrum.backend(), 100), (esplora.backend(), 500)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (manager, wallet) = synced_wallet(dir.path(), backend.clone()).await;
+            {
+                let mut state = manager.state.lock().await;
+                crate::manager::store_block(&mut state, &wallet, forged).unwrap();
+                assert_eq!(
+                    crate::manager::stored_tip(&mut state, &wallet).unwrap(),
+                    forged.height
+                );
+            }
+            let report = manager.sync_wallet(&wallet).await.unwrap();
+            assert_eq!(report.tip_height, honest, "{backend:?}");
+            drop(manager);
+            let manager =
+                crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32]))
+                    .unwrap();
+            assert_eq!(
+                crate::manager::stored_tip(&mut *manager.state.lock().await, &wallet).unwrap(),
+                honest,
+                "{backend:?}"
+            );
+            assert_eq!(
+                manager.sync_wallet(&wallet).await.unwrap().tip_height,
+                honest
+            );
+        }
+    }
+
+    /// A payment confirmed in block 80 of a signet server at 100, then
+    /// a chain at 110 that has the payment nowhere. A server whose block
+    /// 80 does not chain up to its latest blocks is refused, and the
+    /// payment stays confirmed; one whose chain does takes it out, a
+    /// reorganisation like any other.
+    #[tokio::test]
+    async fn a_confirmation_is_taken_back_on_proof_alone() {
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        const WALLET: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+        for forged in [true, false] {
+            let server = FakeElectrum::start().await;
+            let dir = tempfile::tempdir().unwrap();
+            let manager =
+                crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32]))
+                    .unwrap();
+            manager
+                .set_backend(Network::Signet, server.backend())
+                .await
+                .unwrap();
+            let parsed = crate::input::parse_input(WALLET).unwrap();
+            let wallet = manager
+                .add_wallet("Watched", &parsed, Network::Signet)
+                .await
+                .unwrap()
+                .id;
+            let address = &manager.receive_addresses(&wallet, 0).await.unwrap()[0].address;
+            let ours = address
+                .parse::<bdk_wallet::bitcoin::Address<_>>()
+                .unwrap()
+                .assume_checked()
+                .script_pubkey()
+                .to_hex_string();
+            let parent = transaction(&[nowhere(1, 0)], &[(&script(9), 60_000)]);
+            let payment = transaction(
+                &[OutPoint::new(parent.compute_txid(), 0)],
+                &[(&ours, 50_000)],
+            );
+            server.add_tx(&parent);
+            server.add_tx(&payment);
+            server.set_history(&ours, &[(payment.compute_txid(), 80)]);
+            manager.sync_wallet(&wallet).await.unwrap();
+            let confirmations = |snapshot: crate::wallet::snapshot::WalletSnapshot| {
+                snapshot
+                    .txs
+                    .iter()
+                    .map(|tx| tx.confirmations)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                confirmations(manager.wallet_snapshot(&wallet).await.unwrap()),
+                [21]
+            );
+
+            // The payment mined nowhere: every block from 80 up changes.
+            {
+                let mut state = server.state.lock().unwrap();
+                state.histories.clear();
+                state.height = 110;
+                if forged {
+                    let mut header = state.header_of(80);
+                    header.nonce = 7;
+                    state.served.insert(80, header);
+                }
+            }
+            let synced = manager.sync_wallet(&wallet).await;
+            let snapshot = manager.wallet_snapshot(&wallet).await.unwrap();
+            if forged {
+                let refused = synced.unwrap_err();
+                assert_eq!(
+                    refused.code(),
+                    crate::error::ErrorCode::FalseProof,
+                    "{refused}"
+                );
+                assert!(
+                    refused.to_string().contains(proof::UNPROVEN_REORGANISATION),
+                    "{refused}"
+                );
+                assert_eq!(confirmations(snapshot), [21]);
+            } else {
+                assert_eq!(synced.unwrap().tip_height, 110);
+                assert_eq!(confirmations(snapshot), Vec::<u32>::new());
+            }
+        }
+    }
+
+    /// Blocks far above a server's tip are dropped unless one holds a
+    /// confirmation proven with the work of mainnet, at a height a chain
+    /// can have reached.
+    #[test]
+    fn a_server_far_behind_drops_no_confirmation_on_mainnet() {
+        let confirmed = [500_u32, 900_000];
+        let drops =
+            |network, tip| drops_a_confirmation(network, confirmed.into_iter(), tip, 950_000);
+        assert!(drops(Network::Mainnet, 899_000));
+        assert!(!drops(Network::Mainnet, 900_000));
+        assert!(!drops(Network::Signet, 899_000));
+        assert!(!drops_a_confirmation(
+            Network::Mainnet,
+            [4_000_000_000].into_iter(),
+            899_000,
+            950_000
+        ));
+    }
+
+    /// A previous transaction is read only if it is the one asked for:
+    /// its txid is what vouches for the value of the coin.
+    #[test]
+    fn a_previous_transaction_must_hash_to_its_txid() {
+        use bdk_wallet::bitcoin::{Amount, absolute, transaction};
+        let tx = |value: u64| Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let real = tx(1_000);
+        let forged = tx(900_000);
+        let outpoint = OutPoint::new(real.compute_txid(), 0);
+        assert_eq!(
+            output_at(&real, outpoint).unwrap().unwrap().value,
+            Amount::from_sat(1_000)
+        );
+        assert_eq!(
+            output_at(&real, OutPoint::new(real.compute_txid(), 1)).unwrap(),
+            None
+        );
+        assert!(output_at(&forged, outpoint).is_err());
+    }
+
+    /// With a live watch, its operator first, the rest in the backend's
+    /// order behind it: for a preview its web API, which says in one
+    /// request whether a coin is spent, then the watch's own server; for
+    /// a broadcast the watch's server, then the web API. Without one, the
+    /// backend's order as it is.
+    #[test]
+    fn what_is_sent_goes_to_the_operator_of_the_watch_first() {
+        let esplora = |host: &str| Endpoint::Esplora(format!("https://{host}/api"));
+        let live = Endpoint::Electrum(electrum::Target::new(
+            "ssl://electrum.blockstream.info:50002",
+            None,
+        ));
+        let rotation = vec![
+            esplora("mempool.space"),
+            esplora("blockstream.info"),
+            esplora("mempool.emzy.de"),
+        ];
+        assert_eq!(
+            send_order(rotation.clone(), Some(live.clone()), Purpose::Preview),
+            [
+                esplora("blockstream.info"),
+                live.clone(),
+                esplora("mempool.space"),
+                esplora("mempool.emzy.de"),
+            ]
+        );
+        assert_eq!(
+            send_order(rotation.clone(), Some(live.clone()), Purpose::Broadcast),
+            [
+                live.clone(),
+                esplora("blockstream.info"),
+                esplora("mempool.space"),
+                esplora("mempool.emzy.de"),
+            ]
+        );
+        assert_eq!(
+            send_order(rotation.clone(), None, Purpose::Broadcast),
+            rotation
+        );
+        // A host that only ends like the operator's is another operator.
+        let elsewhere = Endpoint::Electrum(electrum::Target::new(
+            "ssl://notblockstream.info:50002",
+            None,
+        ));
+        assert_eq!(
+            send_order(rotation.clone(), Some(elsewhere.clone()), Purpose::Preview)[1..],
+            rotation[..]
+        );
+        // An Electrum server of one's own is its own operator: alone.
+        assert_eq!(
+            send_order(vec![live.clone()], Some(live.clone()), Purpose::Preview),
+            [live]
+        );
+    }
+
+    /// The node's words for a transaction it already holds, in its
+    /// mempool or in a block, whichever server passes them on; any other
+    /// refusal is not that.
+    #[test]
+    fn a_node_that_already_holds_the_transaction_is_told_by_its_words() {
+        for words in [
+            "sendrawtransaction RPC error -26: txn-already-in-mempool",
+            "txn-already-known",
+            "Transaction already known",
+            "sendrawtransaction RPC error -27: Transaction outputs already in utxo set",
+            "Transaction already in block chain",
+        ] {
+            assert!(already_known(words), "{words}");
+        }
+        for words in [
+            "sendrawtransaction RPC error -26: min relay fee not met",
+            "bad-txns-inputs-missingorspent",
+            "txn-mempool-conflict",
+        ] {
+            assert!(!already_known(words), "{words}");
+        }
+    }
+
+    /// bitcoind's verdict on a transaction, in each form the server
+    /// software that relays `sendrawtransaction` gives it, comes back as
+    /// the node's own words; anything else is no verdict, and the next
+    /// endpoint may be asked.
+    #[test]
+    fn only_bitcoinds_verdict_is_a_refusal() {
+        for (message, words) in [
+            // ElectrumX: the node's words, then the transaction echoed.
+            (
+                "the transaction was rejected by network rules.\n\nmin relay fee not met, 0 < 11\n[0200000001ab]",
+                "min relay fee not met, 0 < 11",
+            ),
+            // Fulcrum: the same, without the transaction.
+            (
+                "the transaction was rejected by network rules.\n\nTransaction outputs already in utxo set\n",
+                "Transaction outputs already in utxo set",
+            ),
+            // The electrs of Blockstream, Electrum and web API alike.
+            (
+                "sendrawtransaction RPC error -26: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)",
+                "mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)",
+            ),
+            (
+                "sendrawtransaction RPC error -25: bad-txns-inputs-missingorspent",
+                "bad-txns-inputs-missingorspent",
+            ),
+            // The electrs of mempool.space, and its body quoted again.
+            (
+                r#"sendrawtransaction RPC error: {"code":-27,"message":"Transaction outputs already in utxo set"}"#,
+                "Transaction outputs already in utxo set",
+            ),
+            (
+                r#"sendrawtransaction RPC error: {\"code\":-26,\"message\":\"bad-txns-inputs-missingorspent\"}"#,
+                "bad-txns-inputs-missingorspent",
+            ),
+            // electrs (romanz): the node's words alone.
+            (
+                "min relay fee not met, 0 < 11",
+                "min relay fee not met, 0 < 11",
+            ),
+            ("txn-mempool-conflict", "txn-mempool-conflict"),
+            ("non-BIP68-final", "non-BIP68-final"),
+        ] {
+            assert_eq!(node_verdict(message).as_deref(), Some(words), "{message}");
+        }
+        for message in [
+            "response budget exhausted, retry later",
+            "excessive resource usage",
+            "daemon error: DaemonError({'code': -28, 'message': 'Loading block index...'})",
+            "Daemon is unavailable: connection refused",
+            "sendrawtransaction RPC error -28: Loading block index...",
+            "sendrawtransaction RPC error -22: TX decode failed",
+            "<html><title>Attention Required! | Cloudflare</title></html>",
+            "unsupported protocol version: 1.2",
+            "failed to broadcast transaction: connection refused",
+            "",
+        ] {
+            assert_eq!(node_verdict(message), None, "{message}");
+        }
+        // The words are the node's, cut to a line a screen holds.
+        let long = node_verdict(&format!("bad-txns-{}", "x".repeat(1 << 20))).unwrap();
+        assert_eq!(long.chars().count(), 201);
+    }
+}

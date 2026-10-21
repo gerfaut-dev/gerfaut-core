@@ -1,0 +1,43 @@
+//! Core library of Gerfaut, a Bitcoin watch-only wallet.
+//!
+//! This crate is the single wallet implementation shared by the mobile app
+//! and the desktop app. It handles output descriptors, address derivation,
+//! chain data sources, and encrypted persistence.
+//!
+//! It is watch-only by design: there is no code to generate keys, handle
+//! seeds, or sign transactions, and there never will be. Inputs containing
+//! private key material are rejected at the parsing boundary.
+
+pub mod backup;
+#[cfg(test)]
+mod bridge_contract;
+pub mod broadcast;
+pub mod chain;
+pub mod error;
+pub mod export;
+pub mod format;
+pub mod input;
+pub mod live;
+pub mod lock;
+pub mod manager;
+pub mod network;
+pub mod prefs;
+pub mod price;
+pub mod store;
+#[cfg(test)]
+pub(crate) mod testkit;
+pub mod updates;
+pub mod wallet;
+pub mod watch;
+
+pub use error::{CoreError, CoreResult, ErrorCode};
+pub use manager::WalletManager;
+pub use network::Network;
+
+/// Seconds since the Unix epoch; zero on a clock set before it.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
