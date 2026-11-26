@@ -1,0 +1,6 @@
+{
+  "ready": "ready",
+  "refused": "refused",
+  "unsigned": "unsigned",
+  "in_mempool": "in_mempool"
+}

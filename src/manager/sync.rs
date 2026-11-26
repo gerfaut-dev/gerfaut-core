@@ -1,0 +1,1145 @@
+//! Syncs: a wallet read against the backend of its network, one sync
+//! of a wallet at a time, as far as the caller needs; every wallet of a
+//! network in turn; and the older history of a watched address.
+
+use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+
+use crate::chain::{self, Endpoint};
+use crate::error::{CoreError, CoreResult, ErrorCode};
+use crate::network::Network;
+use crate::now_secs;
+use crate::wallet::meta::{CachedTotals, StoredMeta, SyncStamp, WalletKind};
+use crate::wallet::snapshot::SyncReport;
+use crate::wallet::views;
+use crate::wallet::{AddressTx, AddressWatchState};
+
+use super::{
+    ManagerState, SyncSlot, WalletManager, drop_blocks_above, ensure_engine, find_record,
+    find_record_mut, merge_changeset,
+};
+
+/// Outcome of syncing every wallet of a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncAllReport {
+    pub reports: Vec<SyncReport>,
+    pub failures: Vec<SyncFailure>,
+}
+
+/// One wallet that failed to sync; the others are unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncFailure {
+    pub wallet_id: String,
+    /// The core's words, for logs and for a failure an app has no
+    /// sentence of its own for.
+    pub message: String,
+    /// The code of the failure, the one [`CoreError::code`] gives: what
+    /// an app picks its sentence on, a false proof's among them. A
+    /// failure written before it had one reads as [`ErrorCode::Sync`].
+    #[serde(default = "sync_code")]
+    pub kind: ErrorCode,
+}
+
+impl SyncFailure {
+    /// The failure of the sync of `wallet_id`, in its words and by its code.
+    pub fn of(wallet_id: impl Into<String>, error: &CoreError) -> Self {
+        SyncFailure {
+            wallet_id: wallet_id.into(),
+            message: error.to_string(),
+            kind: error.code(),
+        }
+    }
+}
+
+/// The code of a failure that came without one.
+pub(crate) fn sync_code() -> ErrorCode {
+    ErrorCode::Sync
+}
+
+/// How long routine syncs may go on reading only the counters of the
+/// scripts that did not move before one lists their unconfirmed
+/// transactions again: a day. What the counters cannot tell is a
+/// replacement paying the same amount to the same address.
+const COMPLETE_EVERY_SECS: u64 = 24 * 60 * 60;
+
+/// Whether a sync read every script of the wallet less than a day ago.
+pub(crate) fn complete_lately(meta: &StoredMeta, now: u64) -> bool {
+    meta.complete_at
+        .is_some_and(|at| now.saturating_sub(at) < COMPLETE_EVERY_SECS)
+}
+
+/// How far a sync of the wallet of `meta` reads, asked to read `asked`,
+/// `gap_limit` being the setting now. A wallet never synced, or scanned
+/// with a gap limit below the setting, is scanned in full: only a full
+/// scan looks past the addresses already revealed, and a gap limit was
+/// raised to find funds there. And a day at most since a sync read
+/// every script: the syncs the live watch asks for read only what
+/// moved, whoever asks.
+fn reach_for(asked: Reach, meta: &StoredMeta, gap_limit: u32, now: u64) -> Reach {
+    if meta.last_sync.is_none() || meta.scan_gap < gap_limit {
+        Reach::Full
+    } else if asked.rank() < Reach::Complete.rank() && !complete_lately(meta, now) {
+        Reach::Complete
+    } else {
+        asked
+    }
+}
+
+/// How much of a descriptor wallet a sync reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// These scripts only: the ones the live watch saw move.
+    Scripts(Vec<bdk_wallet::bitcoin::ScriptBuf>),
+    /// The scripts of the transactions waiting for a block.
+    Pending,
+    /// Every revealed script, and the receive addresses past them; an
+    /// Esplora server is asked for the history only of the scripts
+    /// whose counters moved.
+    Checked,
+    /// The same, and the unconfirmed transactions of each script that
+    /// has some listed whatever its counters say.
+    Complete,
+    /// Every script from the first one of each keychain, with the gap
+    /// limit: a first sync, or a rescan.
+    Full,
+}
+
+impl Reach {
+    fn rank(&self) -> u8 {
+        match self {
+            Reach::Scripts(_) | Reach::Pending => 0,
+            Reach::Checked => 1,
+            Reach::Complete => 2,
+            Reach::Full => 3,
+        }
+    }
+
+    /// Whether a sync that read this far read everything `asked` would
+    /// have.
+    fn covers(&self, asked: &Reach) -> bool {
+        match (self, asked) {
+            (Reach::Scripts(read), Reach::Scripts(wanted)) => {
+                wanted.iter().all(|script| read.contains(script))
+            }
+            (Reach::Scripts(_) | Reach::Pending, _) => false,
+            (_, Reach::Scripts(_) | Reach::Pending) => true,
+            _ => self.rank() >= asked.rank(),
+        }
+    }
+}
+
+/// The plan of a sync that reads `reach` of a wallet, and the reach it
+/// comes to: scripts the wallet does not know, past what its index looks
+/// ahead, are only found by a full scan, and a wallet waiting on no
+/// block has nothing pending to read.
+fn plan_for(engine: &bdk_wallet::Wallet, reach: &Reach, gap_limit: u32) -> (chain::Plan, Reach) {
+    use bdk_wallet::KeychainKind;
+    use bdk_wallet::chain::SpkIterator;
+    let reach = match reach {
+        Reach::Scripts(scripts)
+            if scripts
+                .iter()
+                .any(|script| engine.spk_index().index_of_spk(script.clone()).is_none()) =>
+        {
+            Reach::Full
+        }
+        Reach::Pending => match views::pending_scripts(engine) {
+            scripts if scripts.is_empty() => Reach::Checked,
+            scripts => Reach::Scripts(scripts),
+        },
+        other => other.clone(),
+    };
+    let revealed = || -> Vec<bdk_wallet::bitcoin::ScriptBuf> {
+        engine
+            .spk_index()
+            .revealed_spks(..)
+            .map(|(_, script)| script)
+            .collect()
+    };
+    let (scripts, scans, reading) = match &reach {
+        Reach::Full => {
+            let scans = engine
+                .keychains()
+                .map(|(keychain, descriptor)| chain::Scan {
+                    keychain,
+                    spks: Box::new(SpkIterator::new(descriptor.clone())),
+                })
+                .collect();
+            (Vec::new(), scans, chain::Reading::Complete)
+        }
+        Reach::Scripts(scripts) => (scripts.clone(), Vec::new(), chain::Reading::Complete),
+        Reach::Checked | Reach::Complete | Reach::Pending => {
+            // The receive addresses past the last revealed one: where a
+            // payment to an address the wallet never showed lands, one
+            // another app or the signing device handed out.
+            let next = engine
+                .derivation_index(KeychainKind::External)
+                .map_or(0, |last| last.saturating_add(1));
+            let tail = chain::Scan {
+                keychain: KeychainKind::External,
+                spks: Box::new(SpkIterator::new_with_range(
+                    engine.public_descriptor(KeychainKind::External).clone(),
+                    next..,
+                )),
+            };
+            let reading = if reach == Reach::Checked {
+                chain::Reading::Checked
+            } else {
+                chain::Reading::Complete
+            };
+            (revealed(), vec![tail], reading)
+        }
+    };
+    // What the wallet holds for every script it revealed, and for those
+    // of the plan: a rescan reads the revealed ones the way a sync does,
+    // down to what the wallet holds, and any sync reads a script outside
+    // its plan whose confirmation a reorganisation moved.
+    let held = {
+        let mut all = revealed();
+        let known: HashSet<&bdk_wallet::bitcoin::ScriptBuf> = all.iter().collect();
+        let extra: Vec<bdk_wallet::bitcoin::ScriptBuf> = scripts
+            .iter()
+            .filter(|script| !known.contains(script))
+            .cloned()
+            .collect();
+        all.extend(extra);
+        views::held(engine, &all)
+    };
+    let plan = chain::Plan {
+        network: Network::from_bitcoin(engine.network()),
+        tip: engine.latest_checkpoint(),
+        start_time: now_secs(),
+        scripts,
+        scans,
+        stop_gap: gap_limit,
+        reading,
+        held,
+        told: None,
+    };
+    (plan, reach)
+}
+
+impl WalletManager {
+    /// Syncs one wallet against its network's backend. Public backends
+    /// are tried in order until one answers, the server of a running
+    /// live watch first: see `sync_wallet_read`.
+    ///
+    /// Every revealed script is looked at, and nothing the wallet holds
+    /// is fetched again. An Electrum server is asked for the history of
+    /// each script, a list of txids cheaper than any check. An Esplora
+    /// server is asked for the counters of each script first, and for
+    /// its history only when they moved; the first sync of a wallet
+    /// since the vault was opened, and one a day after that, also lists
+    /// the unconfirmed transactions of each script that has some, since
+    /// a replacement paying the same amount leaves the counters as they
+    /// were.
+    pub async fn sync_wallet(&self, id: &str) -> CoreResult<SyncReport> {
+        // Syncing from the moment it is asked for, the wait below
+        // included.
+        let turn = self.sync_turn(id);
+        let (reach, network) = self.routine_reach(id).await;
+        // The sync the app runs, the one as it opens among them, waits
+        // for the first pass of a watch of the wallet's network
+        // (`live_first_pass`), and before it takes the wallet's turn.
+        if let Some(network) = network {
+            self.live_first_pass(network).await;
+        }
+        let read = self.sync_wallet_read(id, reach, None).await;
+        turn.end().await;
+        let (report, _) = read?;
+        self.live_offer(&report);
+        Ok(report)
+    }
+
+    /// Scans a wallet again from its first address with the current gap
+    /// limit, whatever it already knows: an incremental sync only
+    /// watches the addresses it revealed, so funds that landed past
+    /// them, or a descriptor also used elsewhere, are only found by
+    /// starting over. A watched address has no gap: this is a sync.
+    /// Asked for by the person, it does not wait for the first session
+    /// of the live watch.
+    pub async fn rescan_wallet(&self, id: &str) -> CoreResult<SyncReport> {
+        let (report, _) = self.sync_wallet_read(id, Reach::Full, None).await?;
+        self.live_offer(&report);
+        Ok(report)
+    }
+
+    /// How far a sync the app asks for reads: see [`Self::sync_wallet`];
+    /// and the network of the wallet, when there is such a wallet.
+    async fn routine_reach(&self, id: &str) -> (Reach, Option<Network>) {
+        let done_here = self
+            .complete_here
+            .lock()
+            .map(|done| done.contains(id))
+            .unwrap_or(false);
+        // The first sync since the vault was opened reads every script.
+        let asked = if done_here {
+            Reach::Checked
+        } else {
+            Reach::Complete
+        };
+        let state = self.state.lock().await;
+        match find_record(&state.payload, id) {
+            Ok(record) => (
+                reach_for(
+                    asked,
+                    &record.meta,
+                    state.payload.settings.gap_limit,
+                    now_secs(),
+                ),
+                Some(record.meta.network),
+            ),
+            Err(_) => (Reach::Complete, None),
+        }
+    }
+
+    /// One sync of a wallet at a time, whoever asks: the app, a
+    /// background job, the live watch. A caller that arrives while one
+    /// runs waits for it, then runs its own: that sync may have read the
+    /// wallet before what the caller came for happened, a payment the
+    /// watch just heard of. Callers that wait together share the one
+    /// sync that follows: each takes the result of a sync that started
+    /// after it arrived and read at least as much as it would have, with
+    /// nothing listed as new, the lists having gone to the caller that
+    /// ran it. What that sync found worth announcing is in the vault for
+    /// whoever claims it ([`Self::claim_announcements`]), so no caller
+    /// can lose it.
+    ///
+    /// `prefer` is a server to try first: the one the live watch listens
+    /// to, for a sync it asked for. Without it, a running watch's server
+    /// still comes first ([`Self::live_server`]). Returns the report and
+    /// the server that answered; none when the report is another
+    /// caller's.
+    ///
+    /// The wallet is syncing for as long as this runs, and failed after
+    /// it if it fails: see [`WalletSyncState`].
+    pub(crate) async fn sync_wallet_read(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
+        let turn = self.sync_turn(id);
+        let read = self.sync_wallet_in_turn(id, reach, prefer).await;
+        turn.end().await;
+        read
+    }
+
+    async fn sync_wallet_in_turn(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<(SyncReport, Option<Endpoint>)> {
+        let arrived = Instant::now();
+        let slot = match self.syncing.lock() {
+            Ok(mut slots) => slots.entry(id.to_owned()).or_default().clone(),
+            Err(_) => SyncSlot::default(),
+        };
+        let mut last = slot.lock().await;
+        if let Some((started, report, read)) = last.as_ref()
+            && *started > arrived
+            && read.covers(&reach)
+        {
+            let report = SyncReport {
+                new_tx_count: 0,
+                new_txs: Vec::new(),
+                confirmed_txs: Vec::new(),
+                ..report.clone()
+            };
+            return Ok((report, None));
+        }
+        let started = Instant::now();
+        let (report, read, answered) = match self.sync_wallet_alone(id, reach, prefer).await {
+            Ok(done) => done,
+            Err(error) => {
+                // Kept while the wallet's turn is still held: no later
+                // sync of it has read anything yet.
+                if !matches!(error, CoreError::WalletNotFound(_)) {
+                    state::keep_sync_failure(&mut *self.state.lock().await, id, &error);
+                }
+                return Err(error);
+            }
+        };
+        *last = Some((started, report.clone(), read));
+        drop(last);
+        // The scripts this sync revealed, and whether something is
+        // still waiting for a block.
+        self.live_refresh().await;
+        Ok((report, Some(answered)))
+    }
+
+    async fn sync_wallet_alone(
+        &self,
+        id: &str,
+        reach: Reach,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
+        let started = Instant::now();
+
+        // Snapshot what the sync needs; do not hold the lock during I/O.
+        let (meta, gap_limit, config, certs) = {
+            let state = self.state.lock().await;
+            let record = find_record(&state.payload, id)?;
+            let (config, certs) = state.chain_setup(record.meta.network);
+            (
+                record.meta.clone(),
+                state.payload.settings.gap_limit,
+                config,
+                certs,
+            )
+        };
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, prefer)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
+
+        match &meta.kind {
+            WalletKind::Descriptors { .. } => {
+                self.sync_descriptor_wallet(
+                    &meta,
+                    gap_limit,
+                    &endpoints,
+                    proxy.as_deref(),
+                    started,
+                    reach,
+                )
+                .await
+            }
+            WalletKind::SingleAddress { address } => self
+                .sync_address_wallet(&meta, address, &endpoints, proxy.as_deref(), started)
+                .await
+                .map(|(report, answered)| (report, Reach::Full, answered)),
+        }
+    }
+
+    async fn sync_descriptor_wallet(
+        &self,
+        meta: &StoredMeta,
+        gap_limit: u32,
+        endpoints: &[Endpoint],
+        proxy: Option<&str>,
+        started: Instant,
+        reach: Reach,
+    ) -> CoreResult<(SyncReport, Reach, Endpoint)> {
+        let reach = reach_for(reach, meta, gap_limit, now_secs());
+        let mut attempts = Attempts::default();
+
+        for endpoint in endpoints {
+            // Build a fresh plan under the lock (a plan is consumed by
+            // each attempt).
+            let (mut plan, known, reach) = {
+                let mut state = self.state.lock().await;
+                let engine = ensure_engine(&mut state, &meta.id)?;
+                let (plan, reach) = plan_for(engine, &reach, gap_limit);
+                (plan, views::known(engine), reach)
+            };
+            plan.told = self.told_on(endpoint);
+
+            let response = chain::sync_engine(endpoint, plan, proxy).await;
+            match response {
+                Err(detail) => attempts.failed(endpoint, &detail),
+                Ok(synced) => {
+                    let mut state = self.state.lock().await;
+                    let (report, complete) = apply_synced(
+                        &mut state,
+                        meta,
+                        Scanned {
+                            reach: &reach,
+                            gap_limit,
+                        },
+                        synced,
+                        endpoint,
+                        &known,
+                        started,
+                    )?;
+                    // Under the vault's lock, so a removal of the wallet
+                    // that comes next finds it there to forget.
+                    if complete && let Ok(mut done) = self.complete_here.lock() {
+                        done.insert(meta.id.clone());
+                    }
+                    drop(state);
+                    self.answered_after(endpoint, &attempts.down);
+                    return Ok((report, reach, endpoint.clone()));
+                }
+            }
+        }
+
+        Err(sync_failure(endpoints, attempts))
+    }
+
+    /// Syncs a watched address: [`Self::read_address_wallet`]. Removed
+    /// while it synced, the wallet was forgotten before the sync proved
+    /// anything of its address, which goes too, whatever the sync came
+    /// to: a failure or a history not read may follow coins proven on a
+    /// server before them.
+    async fn sync_address_wallet(
+        &self,
+        meta: &StoredMeta,
+        address: &str,
+        endpoints: &[Endpoint],
+        proxy: Option<&str>,
+        started: Instant,
+    ) -> CoreResult<(SyncReport, Endpoint)> {
+        let result = self
+            .read_address_wallet(meta, address, endpoints, proxy, started)
+            .await;
+        let removed = find_record(&self.state.lock().await.payload, &meta.id).is_err();
+        if removed {
+            forget_address_proofs(meta.network, address);
+        }
+        result
+    }
+
+    /// Reads a watched address from the first of `endpoints` that
+    /// answers, and keeps what it read.
+    async fn read_address_wallet(
+        &self,
+        meta: &StoredMeta,
+        address: &str,
+        endpoints: &[Endpoint],
+        proxy: Option<&str>,
+        started: Instant,
+    ) -> CoreResult<(SyncReport, Endpoint)> {
+        let mut attempts = Attempts::default();
+        // What the wallet holds: what the server lists as it was is not
+        // read again.
+        let held: Vec<AddressTx> = {
+            let state = self.state.lock().await;
+            find_record(&state.payload, &meta.id)?
+                .address_state
+                .as_ref()
+                .map(|watch| watch.txs.clone())
+                .unwrap_or_default()
+        };
+        for endpoint in endpoints {
+            let told = self.told_on(endpoint);
+            let fetched = chain::fetch_address_state(
+                endpoint,
+                address,
+                meta.network,
+                proxy,
+                &held,
+                told.as_ref(),
+            )
+            .await;
+            match fetched {
+                Err(detail) => attempts.failed(endpoint, &detail),
+                Ok(Some(watch)) => {
+                    let mut state = self.state.lock().await;
+                    let report =
+                        apply_address_state(&mut state, meta, watch, endpoint, started, true)?;
+                    drop(state);
+                    self.answered_after(endpoint, &attempts.down);
+                    return Ok((report, endpoint.clone()));
+                }
+                // A history its server's own status disowns: nothing was
+                // read, which is said as such, and the address stays as
+                // it was. No other server is asked: the one the watch
+                // listens to is the operator that sees the wallet.
+                Ok(None) => {
+                    self.answered_after(endpoint, &attempts.down);
+                    return Err(CoreError::Sync {
+                        backend: endpoint.label(),
+                        detail: NOT_READ.to_owned(),
+                    });
+                }
+            }
+        }
+        Err(sync_failure(endpoints, attempts))
+    }
+
+    /// Fetches an older round of history for a watched address and
+    /// appends it to the stored list. The balance and the UTXO set
+    /// already cover the whole chain, so only the list grows.
+    ///
+    /// Returns how many transactions were added. Zero means the history
+    /// is exhausted.
+    pub async fn load_more_history(&self, id: &str) -> CoreResult<u32> {
+        let (meta, config, certs, cursor) = {
+            let state = self.state.lock().await;
+            let record = find_record(&state.payload, id)?;
+            let cursor = record
+                .address_state
+                .as_ref()
+                .and_then(|watch| watch.history_cursor.clone());
+            let (config, certs) = state.chain_setup(record.meta.network);
+            (record.meta.clone(), config, certs, cursor)
+        };
+        let WalletKind::SingleAddress { address } = &meta.kind else {
+            return Err(CoreError::InvalidInput {
+                kind: "wallet_kind",
+                detail: "descriptor wallets already carry their full history".to_owned(),
+            });
+        };
+        let Some(cursor) = cursor else {
+            return Ok(0);
+        };
+        let endpoints = self.sync_endpoints(&meta, &config, &certs, None)?;
+        let proxy = self.tor_proxy_for(&endpoints).await?;
+
+        let mut attempts = Attempts::default();
+        for endpoint in &endpoints {
+            match chain::fetch_address_history(
+                endpoint,
+                address,
+                meta.network,
+                &cursor,
+                proxy.as_deref(),
+            )
+            .await
+            {
+                Err(detail) => attempts.failed(endpoint, &detail),
+                Ok(round) => {
+                    let mut state = self.state.lock().await;
+                    let record = find_record_mut(&mut state.payload, id)?;
+                    let Some(watch) = record.address_state.as_mut() else {
+                        return Ok(0);
+                    };
+                    let known: std::collections::HashSet<String> =
+                        watch.txs.iter().map(|tx| tx.txid.clone()).collect();
+                    let fresh: Vec<_> = round
+                        .txs
+                        .into_iter()
+                        .filter(|tx| !known.contains(&tx.txid))
+                        .collect();
+                    let added = fresh.len() as u32;
+                    watch.txs.extend(fresh);
+                    watch.history_cursor = round.cursor;
+                    watch.truncated = watch.history_cursor.is_some();
+                    let tx_count = watch.txs.len() as u32;
+                    record.meta.cached.tx_count = tx_count;
+                    state.vault.save(&state.payload)?;
+                    drop(state);
+                    self.answered_after(endpoint, &attempts.down);
+                    return Ok(added);
+                }
+            }
+        }
+        Err(sync_failure(&endpoints, attempts))
+    }
+
+    /// The servers a sync of the wallet of `meta` tries, in order.
+    ///
+    /// `prefer` is the server of the watch that asked for the sync: it
+    /// told of the change, so it holds what changed. For any other sync,
+    /// and for the older history of a watched address, the server a
+    /// running watch talks to, or last talked to (`live_server`): it
+    /// already sees every script the watch follows, and reading there
+    /// shows the wallet to no second operator. Only a server a watch of
+    /// the wallet's own network may talk to under its backend: the watch
+    /// may have moved to another network, or another backend, since, and
+    /// a wallet's addresses never go to a server its backend does not
+    /// name. Then [`sync_order`], the relegated servers last
+    /// ([`Relegations`]), and never before the server of the watch.
+    fn sync_endpoints(
+        &self,
+        meta: &StoredMeta,
+        config: &chain::BackendConfig,
+        certs: &chain::TrustedCerts,
+        prefer: Option<(Network, Endpoint)>,
+    ) -> CoreResult<Vec<Endpoint>> {
+        let first = prefer
+            .or_else(|| self.live_server())
+            .filter(|(network, prefer)| {
+                *network == meta.network
+                    && crate::watch::servers_for(config, meta.network, certs)
+                        .is_ok_and(|allowed| allowed.contains(prefer))
+            })
+            .map(|(_, prefer)| prefer);
+        let answered = meta
+            .last_sync
+            .as_ref()
+            .and_then(|stamp| stamp.server.as_deref());
+        let endpoints = sync_order(
+            chain::endpoints(config, meta.network, certs)?,
+            answered,
+            first.clone(),
+        );
+        Ok(self.relegated_last(endpoints, first.as_ref()))
+    }
+
+    /// `endpoints` with the ones relegated now tried after the others:
+    /// see [`Relegations`].
+    pub(crate) fn relegated_last(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+    ) -> Vec<Endpoint> {
+        match self.relegated.lock() {
+            Ok(relegated) => relegated.order(endpoints, first, tokio::time::Instant::now()),
+            Err(_) => endpoints,
+        }
+    }
+
+    /// `answered` answered after each of `failed` did not: see
+    /// [`Relegations::answered`].
+    pub(crate) fn answered_after(&self, answered: &Endpoint, failed: &[&Endpoint]) {
+        if let Ok(mut relegated) = self.relegated.lock() {
+            relegated.answered(answered, failed, tokio::time::Instant::now());
+        }
+    }
+
+    /// Syncs every wallet of a network (or all of them), sequentially:
+    /// public backends are shared infrastructure, not something to
+    /// hammer in parallel. One failure does not stop the others.
+    pub async fn sync_all(&self, network: Option<Network>) -> SyncAllReport {
+        let metas = self.list_wallets(network).await;
+        let mut report = SyncAllReport {
+            reports: Vec::new(),
+            failures: Vec::new(),
+        };
+        for meta in metas {
+            match self.sync_wallet(&meta.id).await {
+                Ok(sync) => report.reports.push(sync),
+                Err(error) => report.failures.push(SyncFailure::of(meta.id, &error)),
+            }
+        }
+        report
+    }
+}
+
+/// Why the sync of a watched address read nothing: the server's history
+/// of it does not hash to the status it announced to the live watch,
+/// and leaves out what the wallet holds there.
+const NOT_READ: &str = "the server's history does not match what it announced: not read";
+
+/// A report of a wallet that took nothing: what it holds, as it was.
+pub(super) fn nothing_new(
+    id: &str,
+    balance: crate::wallet::snapshot::BalanceSnapshot,
+    tip_height: u32,
+    server: &Endpoint,
+    started: Instant,
+) -> SyncReport {
+    SyncReport {
+        wallet_id: id.to_owned(),
+        new_tx_count: 0,
+        new_txs: Vec::new(),
+        confirmed_txs: Vec::new(),
+        balance,
+        tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: server.label(),
+    }
+}
+
+/// How far a sync of a descriptor wallet read: its reach, and the gap
+/// limit its scans stopped at.
+struct Scanned<'a> {
+    reach: &'a Reach,
+    gap_limit: u32,
+}
+
+/// Forgets what this session proved of `address` on `network`, on every
+/// server.
+fn forget_address_proofs(network: Network, address: &str) {
+    use bdk_wallet::bitcoin::Address;
+    use bdk_wallet::bitcoin::address::NetworkUnchecked;
+    if let Ok(address) = address.parse::<Address<NetworkUnchecked>>() {
+        crate::chain::proof::forget_proven_on(
+            network,
+            &HashSet::from([address.assume_checked().script_pubkey()]),
+        );
+    }
+}
+
+/// Takes what a sync of a descriptor wallet that read as far as
+/// `scanned` came to, read from `endpoint`, `known` being what the
+/// wallet held before: applied to the wallet, what it found recorded
+/// for whoever announces, and the vault saved. Also says whether it
+/// read every script: a sync that set a history aside is not the
+/// complete read of the day, nor the scan of a gap limit.
+fn apply_synced(
+    state: &mut ManagerState,
+    meta: &StoredMeta,
+    scanned: Scanned<'_>,
+    synced: chain::Synced,
+    endpoint: &Endpoint,
+    known: &views::Known,
+    started: Instant,
+) -> CoreResult<(SyncReport, bool)> {
+    let Scanned { reach, gap_limit } = scanned;
+    let whole = !synced.set_aside;
+    // A wallet removed while it synced leaves nothing of the sync
+    // behind, the order its scripts were listed in included.
+    find_record(&state.payload, &meta.id)?;
+    state.orders.extend(synced.orders);
+    let vanishing = crate::live::news::vanishing(&state.payload, &meta.id);
+    if let Some(height) = synced.drop_above {
+        drop_blocks_above(state, &meta.id, height)?;
+    }
+    let engine = ensure_engine(state, &meta.id)?;
+    engine
+        .apply_update(synced.update)
+        .map_err(|e| CoreError::Sync {
+            backend: endpoint.label(),
+            detail: e.to_string(),
+        })?;
+
+    let balance = views::balance(engine);
+    let tip_height = views::tip_height(engine);
+    let tx_count_after = engine.transactions().count() as u32;
+    let moves = views::moves(engine, known);
+    let read = match reach {
+        Reach::Scripts(scripts) => Some(scripts.iter().cloned().collect()),
+        _ => None,
+    };
+    let recheck = views::recheck(engine, &vanishing, read.as_ref());
+    let (new_txs, confirmed_txs) = moves.lines();
+    let staged = engine.take_staged();
+
+    if let Some(staged) = staged {
+        merge_changeset(state, &meta.id, staged)?;
+    }
+    let now = now_secs();
+    crate::live::news::record(
+        &mut state.payload,
+        &meta.id,
+        meta.last_sync.is_none(),
+        &moves,
+        now,
+    );
+    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
+    let report = SyncReport {
+        wallet_id: meta.id.clone(),
+        new_tx_count: new_txs.len() as u32,
+        new_txs,
+        confirmed_txs,
+        balance,
+        tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: endpoint.label(),
+    };
+    let scanned = (*reach == Reach::Full && whole).then_some(gap_limit);
+    let complete = matches!(reach, Reach::Full | Reach::Complete) && whole;
+    finish_sync(
+        state,
+        &meta.id,
+        &report,
+        endpoint,
+        tx_count_after,
+        scanned,
+        complete,
+    )?;
+    Ok((report, complete))
+}
+
+/// Takes the state of a watched address read from `endpoint`: what
+/// changed against the state stored recorded for whoever announces, the
+/// older rounds the user loaded kept, and the vault saved. `complete`
+/// says it was read whole.
+fn apply_address_state(
+    state: &mut ManagerState,
+    meta: &StoredMeta,
+    mut watch: AddressWatchState,
+    endpoint: &Endpoint,
+    started: Instant,
+    complete: bool,
+) -> CoreResult<SyncReport> {
+    // Against the state as stored, before the older rounds are carried
+    // over into the fresh one.
+    let moves = views::address_moves(
+        find_record(&state.payload, &meta.id)?
+            .address_state
+            .as_ref(),
+        &watch,
+    );
+    let recheck = views::address_recheck(
+        &crate::live::news::vanishing(&state.payload, &meta.id),
+        &watch,
+    );
+    let (new_txs, confirmed_txs) = moves.lines();
+    // A sync fetches the newest round only. Keep the older rounds the
+    // user already loaded, otherwise every sync would silently undo
+    // "load older transactions".
+    if let Some(previous) = find_record(&state.payload, &meta.id)?
+        .address_state
+        .as_ref()
+    {
+        keep_older_history(&mut watch, previous);
+    }
+    let tx_count_after = watch.txs.len() as u32;
+    let now = now_secs();
+    crate::live::news::record(
+        &mut state.payload,
+        &meta.id,
+        meta.last_sync.is_none(),
+        &moves,
+        now,
+    );
+    crate::live::news::settle(&mut state.payload, &meta.id, &recheck, now);
+    let report = SyncReport {
+        wallet_id: meta.id.clone(),
+        new_tx_count: new_txs.len() as u32,
+        new_txs,
+        confirmed_txs,
+        balance: views::address_balance(&watch),
+        tip_height: watch.tip_height,
+        took_ms: started.elapsed().as_millis() as u64,
+        backend: endpoint.label(),
+    };
+    find_record_mut(&mut state.payload, &meta.id)?.address_state = Some(watch);
+    finish_sync(
+        state,
+        &meta.id,
+        &report,
+        endpoint,
+        tx_count_after,
+        None,
+        complete,
+    )?;
+    Ok(report)
+}
+
+/// The order a sync tries the servers of its backend in. `first`, a
+/// server the live watch talks to, comes before all. Then the server
+/// that answered the last sync, `answered` as [`Endpoint::key`] gives
+/// it: on networks where one public instance is blocked, this skips a
+/// dead 20-second timeout on every sync. It is told by its protocol and
+/// port as well as its host, since an Electrum server that answered
+/// says nothing of the web API its operator runs at the same host. Then
+/// the rest, in the order the backend lists them.
+fn sync_order(
+    mut endpoints: Vec<Endpoint>,
+    answered: Option<&str>,
+    first: Option<Endpoint>,
+) -> Vec<Endpoint> {
+    if let Some(answered) = answered
+        && let Some(position) = endpoints
+            .iter()
+            .position(|endpoint| endpoint.key() == answered)
+    {
+        let answered = endpoints.remove(position);
+        endpoints.insert(0, answered);
+    }
+    if let Some(first) = first {
+        endpoints.retain(|endpoint| *endpoint != first);
+        endpoints.insert(0, first);
+    }
+    endpoints
+}
+
+/// What the servers a sync tried before one answered said, and what
+/// their failures were. Decided on the kind each failure carries
+/// ([`chain::FaultKind`]), set where the core wrote its words: never on
+/// the words, those of a server least of all.
+#[derive(Default)]
+pub(super) struct Attempts<'a> {
+    /// Each server's words, for the error the sync fails with.
+    said: Vec<String>,
+    /// The ones relegated if a later one answers: those that were down
+    /// ([`chain::FaultKind::Outage`]).
+    down: Vec<&'a Endpoint>,
+    /// Whether one of them sent a proof that does not hold
+    /// ([`chain::FaultKind::FalseProof`]).
+    false_proof: bool,
+}
+
+impl<'a> Attempts<'a> {
+    pub(super) fn failed(&mut self, endpoint: &'a Endpoint, fault: &chain::Fault) {
+        match fault.kind() {
+            chain::FaultKind::Outage => self.down.push(endpoint),
+            chain::FaultKind::FalseProof => self.false_proof = true,
+            chain::FaultKind::Other => {}
+        }
+        self.said.push(format!("{}: {fault}", endpoint.label()));
+    }
+}
+
+/// How long a server that failed while a later one answered is first
+/// tried after the others: five minutes, doubled each time it fails so
+/// again before it answers, up to an hour.
+const RELEGATION_FIRST: Duration = Duration::from_secs(5 * 60);
+const RELEGATION_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// The servers a sync tries after the others for a while. One that is
+/// down where a later one of the same list answers costs its timeout to
+/// every sync that starts with it, wallet after wallet: it is tried last
+/// for [`RELEGATION_FIRST`], then twice as long each time it is so
+/// again, up to [`RELEGATION_MAX`], and no longer once it answers. An
+/// hour past its last relegation, it starts over from the first.
+///
+/// Only an outage counts ([`chain::FaultKind::Outage`]): a refusal of one
+/// request, a history too long for that server, says nothing of the
+/// next wallet, and relegating the server for it would send that wallet
+/// to the others. When every server fails, the request is at fault, and
+/// none is relegated.
+///
+/// Only the order changes, among the servers the backend names: none
+/// is added, since the more often a sync turns to the others, the more
+/// of them see its addresses over time. Nor is the server of the live
+/// watch ever put behind another: it already sees every script the
+/// watch follows, and a sync there shows the wallet to no second
+/// operator.
+#[derive(Debug, Default)]
+pub(crate) struct Relegations(HashMap<Endpoint, Relegation>);
+
+#[derive(Debug, Clone, Copy)]
+struct Relegation {
+    until: tokio::time::Instant,
+    /// Times it was relegated with no answer in between.
+    count: u32,
+}
+
+impl Relegations {
+    /// `endpoints` in the order a sync tries them: the ones relegated
+    /// at `now` after the others, each part in the order it had. `first`
+    /// stays where it is.
+    fn order(
+        &self,
+        endpoints: Vec<Endpoint>,
+        first: Option<&Endpoint>,
+        now: tokio::time::Instant,
+    ) -> Vec<Endpoint> {
+        let (kept, relegated): (Vec<Endpoint>, Vec<Endpoint>) =
+            endpoints.into_iter().partition(|endpoint| {
+                Some(endpoint) == first
+                    || self
+                        .0
+                        .get(endpoint)
+                        .is_none_or(|relegation| relegation.until <= now)
+            });
+        kept.into_iter().chain(relegated).collect()
+    }
+
+    /// `answered` answered at `now`, after each of `failed` was down:
+    /// those are relegated, unless one already is, by another sync that
+    /// met the same outage, and `answered` is no longer. A relegation
+    /// over for [`RELEGATION_MAX`] is forgotten.
+    fn answered(&mut self, answered: &Endpoint, failed: &[&Endpoint], now: tokio::time::Instant) {
+        self.0
+            .retain(|_, relegation| relegation.until + RELEGATION_MAX > now);
+        self.0.remove(answered);
+        for endpoint in failed {
+            let relegation = self.0.entry((*endpoint).clone()).or_insert(Relegation {
+                until: now,
+                count: 0,
+            });
+            if relegation.until > now {
+                continue;
+            }
+            relegation.until = now + relegation_for(relegation.count);
+            relegation.count = relegation.count.saturating_add(1);
+        }
+    }
+}
+
+/// [`RELEGATION_FIRST`] doubled once for each relegation before it.
+fn relegation_for(before: u32) -> Duration {
+    RELEGATION_FIRST
+        .checked_mul(2u32.saturating_pow(before))
+        .map_or(RELEGATION_MAX, |period| period.min(RELEGATION_MAX))
+}
+
+/// One error covering every endpoint tried, so the user sees each
+/// backend's outcome instead of only the last one. When one of them was
+/// refused for a proof that does not hold, the error says so by its code
+/// ([`CoreError::FalseProof`]): a failure the core marked so, never words
+/// that read like it ([`chain::FaultKind::FalseProof`]).
+pub(super) fn sync_failure(endpoints: &[Endpoint], attempts: Attempts<'_>) -> CoreError {
+    let backend = config_label(endpoints);
+    let said = attempts.said;
+    if attempts.false_proof {
+        return CoreError::FalseProof {
+            backend,
+            detail: said.join("; "),
+        };
+    }
+    CoreError::Sync {
+        backend,
+        detail: if said.is_empty() {
+            "no backend available".to_owned()
+        } else {
+            said.join("; ")
+        },
+    }
+}
+
+fn config_label(endpoints: &[Endpoint]) -> String {
+    endpoints
+        .first()
+        .map(|e| e.label())
+        .unwrap_or_else(|| "backend".to_owned())
+}
+
+/// Carries the deep history of `previous` over to a freshly synced
+/// `watch`, which only holds the newest round.
+///
+/// Only transactions confirmed strictly below the fresh round's oldest
+/// block are kept: that part of the chain is settled, while anything
+/// inside the fresh window is authoritative in `watch` (a replacement or
+/// a reorg must not be resurrected).
+fn keep_older_history(watch: &mut AddressWatchState, previous: &AddressWatchState) {
+    let Some(oldest_fresh) = watch.txs.iter().filter_map(|tx| tx.height).min() else {
+        return;
+    };
+    let known: std::collections::HashSet<&str> =
+        watch.txs.iter().map(|tx| tx.txid.as_str()).collect();
+    let older: Vec<AddressTx> = previous
+        .txs
+        .iter()
+        .filter(|tx| tx.height.is_some_and(|height| height < oldest_fresh))
+        .filter(|tx| !known.contains(tx.txid.as_str()))
+        .cloned()
+        .collect();
+    if older.is_empty() {
+        return;
+    }
+    watch.txs.extend(older);
+    // The deeper cursor wins: the list now reaches at least that far.
+    watch.history_cursor = previous.history_cursor.clone();
+    watch.truncated = watch.history_cursor.is_some();
+}
+
+/// Updates cached totals and the sync stamp, then persists the vault.
+///
+/// `tx_count` is the absolute engine count after the sync, never an
+/// accumulated delta: replacements, evictions, and interleaved syncs
+/// must not make the cached figure drift. `scanned_gap` is the gap limit
+/// a full scan just covered, `None` after an incremental sync.
+/// `complete` says the sync read every script it could have.
+/// `answered` is the server that answered, which the next sync tries
+/// first.
+fn finish_sync(
+    state: &mut ManagerState,
+    id: &str,
+    report: &SyncReport,
+    answered: &Endpoint,
+    tx_count: u32,
+    scanned_gap: Option<u32>,
+    complete: bool,
+) -> CoreResult<()> {
+    {
+        let record = find_record_mut(&mut state.payload, id)?;
+        record.meta.cached = CachedTotals {
+            balance: report.balance,
+            tx_count,
+        };
+        if let Some(gap) = scanned_gap {
+            record.meta.scan_gap = gap;
+        }
+        if complete {
+            record.meta.complete_at = Some(now_secs());
+        }
+        record.meta.last_sync = Some(SyncStamp {
+            at: now_secs(),
+            tip_height: report.tip_height,
+            backend: report.backend.clone(),
+            server: Some(answered.key()),
+        });
+        record.meta.last_failure = None;
+    }
+    state.vault.save(&state.payload)?;
+    Ok(())
+}
+
+mod foretold;
+mod state;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use state::SyncBoard;
+#[cfg(test)]
+pub(crate) use state::keep_sync_failure;
+pub use state::{WalletSync, WalletSyncState};

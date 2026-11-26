@@ -1,0 +1,34 @@
+{
+  "reached_electrum": {
+    "outcome": "reached",
+    "host": "electrum.example.org:50002",
+    "height": 912345,
+    "software": "Fulcrum 2.1.3",
+    "tor": false,
+    "millis": 840
+  },
+  "reached_esplora_over_tor": {
+    "outcome": "reached",
+    "host": "fixturefixturefixturefixturefixturefixturefixturefixture.onion",
+    "height": 912345,
+    "software": null,
+    "tor": true,
+    "millis": 14200
+  },
+  "another_network": {
+    "outcome": "failed",
+    "host": "electrum.example.org:50002",
+    "problem": "another_network",
+    "detail": "the server is on another network",
+    "server_network": "testnet4",
+    "tor": false
+  },
+  "refused": {
+    "outcome": "failed",
+    "host": "electrum.example.org:50001",
+    "problem": "refused",
+    "detail": "could not connect",
+    "server_network": null,
+    "tor": false
+  }
+}

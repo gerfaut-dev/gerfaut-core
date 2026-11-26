@@ -1,0 +1,20 @@
+{
+  "default": {
+    "unit": "btc",
+    "masked": false,
+    "fiat": false,
+    "fiat_currency": "eur",
+    "price_source": "mempool_space",
+    "notify_new_tx": false,
+    "explorer_ack": false
+  },
+  "chosen": {
+    "unit": "sats",
+    "masked": true,
+    "fiat": true,
+    "fiat_currency": "chf",
+    "price_source": "mempool_space",
+    "notify_new_tx": true,
+    "explorer_ack": true
+  }
+}

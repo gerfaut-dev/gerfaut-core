@@ -1,0 +1,93 @@
+{
+  "idle": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": null
+  },
+  "through_system": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "system",
+    "socks": "127.0.0.1:9050",
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": "this_account"
+  },
+  "auto_passed_over_another_account": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "embedded",
+    "socks": "127.0.0.1:41935",
+    "running": true,
+    "bootstrapped": true,
+    "bootstrap_percent": 100,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": "other_account"
+  },
+  "system_held_by_another_account": {
+    "mode": "system",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "system",
+    "socks": "127.0.0.1:9050",
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": "other_account"
+  },
+  "built_in_starting": {
+    "mode": "embedded",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": true,
+    "bootstrapped": false,
+    "bootstrap_percent": 40,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": null
+  },
+  "built_in_running_untrusted_loopback": {
+    "mode": "auto",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": "embedded",
+    "socks": "127.0.0.1:41935",
+    "running": true,
+    "bootstrapped": true,
+    "bootstrap_percent": 100,
+    "error": null,
+    "embedded_available": true,
+    "system_socks_trusted": false,
+    "system_socks_owner": null
+  },
+  "built_in_failed": {
+    "mode": "embedded",
+    "socks_proxy": "127.0.0.1:9050",
+    "via": null,
+    "socks": null,
+    "running": false,
+    "bootstrapped": false,
+    "bootstrap_percent": 0,
+    "error": "could not reach the Tor network",
+    "embedded_available": true,
+    "system_socks_trusted": true,
+    "system_socks_owner": null
+  }
+}

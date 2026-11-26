@@ -1,0 +1,15 @@
+{
+  "host_not_found": "host_not_found",
+  "refused": "refused",
+  "no_answer": "no_answer",
+  "tor": "tor",
+  "not_tls": "not_tls",
+  "needs_tls": "needs_tls",
+  "certificate": "certificate",
+  "not_electrum": "not_electrum",
+  "not_esplora": "not_esplora",
+  "another_network": "another_network",
+  "bad_chain": "bad_chain",
+  "server_refused": "server_refused",
+  "failed": "failed"
+}

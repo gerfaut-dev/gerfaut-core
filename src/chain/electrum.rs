@@ -1,0 +1,2201 @@
+//! Electrum backend: descriptor wallet sync over the user's own server.
+//!
+//! The Electrum client of BDK is blocking. Each operation runs on a
+//! thread of its own, never on the runtime's blocking pool: a call
+//! waiting on a server there would hold a runtime shutdown, and with it
+//! the exit of the app, for as long as the server takes. The caller
+//! awaits the thread under a deadline, and the moment it stops waiting,
+//! the deadline passed or its future dropped, the socket is shut down:
+//! the server sees the connection end there and then, and the thread
+//! ends when its read returns, at once on Linux and at the latest at the
+//! socket timeout on Windows, where a shutdown does not wake a read
+//! already waiting.
+//!
+//! Every socket is opened here: TCP, the Tor proxy in front of it for a
+//! hidden service, and TLS by [`crate::chain::tls`], so the certificate
+//! a self-hosted server presents goes through Gerfaut's own verifier: a
+//! public authority, or the fingerprint the user accepted for that
+//! host. What the client reads goes through [`Guarded`], which cuts off
+//! a line longer than [`MAX_LINE`].
+
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bdk_wallet::bitcoin::{OutPoint, ScriptBuf, Transaction, Txid};
+use electrum_client::raw_client::RawClient;
+use electrum_client::socks::Socks5Stream;
+use electrum_client::{self, ElectrumApi, Param};
+
+use super::tls::{self, ConnectError, Verdict};
+use super::{Failure, Fault};
+
+pub(crate) mod address;
+pub(crate) mod check;
+pub(crate) mod rpc;
+pub(crate) mod status;
+pub(crate) mod sync;
+
+/// Socket timeout, each read and each write. Without it a stalled
+/// server holds a call until its deadline.
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
+/// Onion endpoints get more room: Tor circuits are slow to build.
+pub(crate) const TOR_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest an operation of a few calls may take, all of them
+/// together: a broadcast, a lookup, a certificate check.
+const CALL_DEADLINE: Duration = Duration::from_secs(90);
+const TOR_CALL_DEADLINE: Duration = Duration::from_secs(4 * 60);
+/// The longest line read from a server. A whole transaction, hex
+/// encoded, fits with room to spare, and so does a history as long as
+/// the public servers hand out. A server that sends more without a
+/// line end is not speaking the protocol, and is cut off rather than
+/// buffered.
+pub(crate) const MAX_LINE: usize = 16 << 20;
+/// Name Gerfaut announces in `server.version`.
+pub(crate) const CLIENT_NAME: &str = "gerfaut";
+/// Protocol version asked for, as an exact range. `electrum-client`
+/// reads block headers in the 1.4 shape unless it negotiated the version
+/// itself, which it cannot do on a stream Gerfaut opened: pinning both
+/// sides to 1.4 keeps the wire and the parser in agreement.
+pub(crate) const PROTOCOL: &str = "1.4";
+
+/// Default ports of the Electrum protocol.
+const SSL_PORT: u16 = 50002;
+const TCP_PORT: u16 = 50001;
+
+/// One Electrum server, with the certificate fingerprint the user
+/// accepted for it, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Target {
+    pub url: String,
+    pub pin: Option<String>,
+}
+
+impl Target {
+    pub(crate) fn new(url: impl Into<String>, pin: Option<String>) -> Self {
+        Target {
+            url: url.into(),
+            pin,
+        }
+    }
+
+    /// How a connection to this server is secured, `tls` as [`parse`]
+    /// read the address: TLS checked by the verifier every Electrum
+    /// connection goes through, the fingerprint accepted for this server
+    /// included, or nothing over plain TCP.
+    pub(crate) fn security(&self, tls: bool) -> crate::chain::net::Security<'_> {
+        if tls {
+            crate::chain::net::Security::Electrum {
+                pin: self.pin.as_deref(),
+            }
+        } else {
+            crate::chain::net::Security::Plain
+        }
+    }
+}
+
+/// What a settings screen needs to know about a server's certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Inspection {
+    /// Plain TCP: there is no certificate, and anything on the path
+    /// reads the traffic.
+    NotTls,
+    /// A Tor hidden service: the onion address is the server's identity.
+    Tor,
+    /// A TLS server, and what its certificate amounts to.
+    Tls(Verdict),
+}
+
+/// Splits `ssl://host:port` into its parts. A bare `host:port` is TLS,
+/// the way every Electrum client has always read it.
+pub(crate) fn parse(url: &str) -> Result<(bool, String, u16), String> {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("ssl".to_owned(), url),
+    };
+    let tls = match scheme.as_str() {
+        "ssl" | "tls" => true,
+        "tcp" => false,
+        other => return Err(format!("{other}:// is not an Electrum address")),
+    };
+    let rest = rest.split(['/', '?']).next().unwrap_or_default();
+    let default_port = if tls { SSL_PORT } else { TCP_PORT };
+    let port_of = |port: &str| {
+        port.parse::<u16>()
+            .map_err(|_| format!("{port} is not a port number"))
+    };
+    // An IPv6 literal is bracketed precisely so its own colons are not
+    // read as a port separator.
+    let (host, port) = match rest.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, tail) = bracketed
+                .split_once(']')
+                .ok_or_else(|| "the address opens a bracket it never closes".to_owned())?;
+            match tail.strip_prefix(':') {
+                Some(port) => (host, port_of(port)?),
+                None => (host, default_port),
+            }
+        }
+        None => match rest.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, port_of(port)?),
+            _ => (rest, default_port),
+        },
+    };
+    if host.is_empty() {
+        return Err("the address has no host".to_owned());
+    }
+    // Read the way the URL standard reads a host, as the Tor check
+    // reads it. A name it cannot read, such as one with a port still in
+    // it (`[x.onion:50001]`, or `x.onion:50001:50002`), is refused here:
+    // passed on, it looked like no onion at all, and the system
+    // resolver was asked for it in the clear.
+    let host =
+        crate::chain::canonical_host(host).map_err(|_| format!("{host} is not a server name"))?;
+    Ok((tls, host, port))
+}
+
+/// The key a trusted fingerprint is stored under: the host and port
+/// that identify the socket, scheme and path stripped. The host is
+/// read the way the settings store it, in lower case and without the
+/// trailing dot of a fully qualified name, so a certificate accepted
+/// under one spelling of the address is found under every other. A
+/// host the URL standard cannot read keys as written.
+pub fn certificate_key(url: &str) -> String {
+    match parse(url) {
+        Ok((_, host, port)) => {
+            let host = crate::chain::canonical_host(&host).unwrap_or(host);
+            format!("{host}:{port}")
+        }
+        Err(_) => url.to_owned(),
+    }
+}
+
+/// The socket of a connection, shared by the thread that reads and
+/// writes it and by the [`Cancel`] that shuts it down: one handle, never
+/// a copy. On Windows, a copy made with `try_clone` right after a timed
+/// connect is at times refused every call, the shutdown among them
+/// (WSAENOTCONN), and the connection then outlived its abandonment until
+/// its next timeout.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedSocket(Arc<TcpStream>);
+
+impl SharedSocket {
+    fn new(socket: TcpStream) -> Self {
+        SharedSocket(Arc::new(socket))
+    }
+}
+
+impl Read for SharedSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for SharedSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+/// What abandons a connection from outside the thread that uses it: a
+/// flag every read and write checks, and the socket itself, shut down so
+/// that the server sees the connection end at once, and a read waiting
+/// on it returns (at once, or at the socket timeout on Windows).
+#[derive(Debug, Default)]
+pub(crate) struct Cancel {
+    cancelled: AtomicBool,
+    socket: Mutex<Option<SharedSocket>>,
+}
+
+impl Cancel {
+    /// Keeps the socket a connection was opened on. One abandoned before
+    /// this point is shut down here.
+    fn hold(&self, socket: &SharedSocket) -> Result<(), ConnectError> {
+        if let Ok(mut held) = self.socket.lock() {
+            *held = Some(socket.clone());
+        }
+        if self.is_cancelled() {
+            self.abort();
+            return Err(ConnectError::Io(ABANDONED.to_owned()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abort(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Ok(held) = self.socket.lock()
+            && let Some(socket) = held.as_ref()
+        {
+            let _ = socket.0.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+const ABANDONED: &str = "the call was abandoned";
+
+/// Aborts the connection it guards when dropped. The future awaiting a
+/// thread holds one, so a caller that stops waiting, for whatever
+/// reason, never leaves a thread talking to the server.
+struct AbortOnDrop(Arc<Cancel>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A stream the blocking client can read and write.
+trait Stream: Read + Write + Send {}
+impl<T: Read + Write + Send> Stream for T {}
+
+/// The stream every blocking connection is read through: it refuses to
+/// go on once the call is abandoned, cuts off a server that sends a
+/// line longer than `limit`, which the client would otherwise buffer
+/// whole, and one that sends more than [`MAX_READ`] in all: the client
+/// queues every notification a server pushes, unbounded.
+pub(crate) struct Guarded {
+    inner: Box<dyn Stream>,
+    cancel: Arc<Cancel>,
+    /// Bytes read since the last line end.
+    unended: usize,
+    limit: usize,
+    /// Bytes read since the connection opened.
+    total: usize,
+}
+
+/// The most one connection reads, every answer together: far past the
+/// full scan of any wallet a phone holds.
+pub(crate) const MAX_READ: usize = 256 << 20;
+
+impl Guarded {
+    fn new(inner: Box<dyn Stream>, cancel: Arc<Cancel>, limit: usize) -> Self {
+        Guarded {
+            inner,
+            cancel,
+            unended: 0,
+            limit,
+            total: 0,
+        }
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        if self.cancel.is_cancelled() {
+            // Not `Interrupted`: a reader retries that one.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                ABANDONED,
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Read for Guarded {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        let read = self.inner.read(buf)?;
+        match buf[..read].iter().rposition(|byte| *byte == b'\n') {
+            Some(end) => self.unended = read - end - 1,
+            None => self.unended = self.unended.saturating_add(read),
+        }
+        if self.unended > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                too_long(self.limit),
+            ));
+        }
+        self.total = self.total.saturating_add(read);
+        if self.total > MAX_READ {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the server sent more than {} MiB on one connection",
+                    MAX_READ >> 20
+                ),
+            ));
+        }
+        Ok(read)
+    }
+}
+
+impl Write for Guarded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+
+/// What a server that sent more than a line may hold is told it did.
+pub(crate) fn too_long(limit: usize) -> String {
+    format!("the server sent an answer longer than {} MiB", limit >> 20)
+}
+
+/// A connected client.
+pub(crate) type Connection = RawClient<Guarded>;
+
+/// Whether this server is a hidden service: by the URL parser, and by
+/// the host [`parse`] reads out of the address, which is the name a
+/// connection would hand the resolver. The two agree on every address
+/// stored the way the settings store it. One typed as
+/// `ssl://[x.onion]:50002`, which the URL parser gives up on and
+/// [`parse`] reads as `x.onion`, is still an onion.
+fn is_onion(target: &Target, host: &str) -> bool {
+    crate::chain::is_onion(&target.url) || crate::chain::is_onion_host(host)
+}
+
+/// Opens the connection. `proxy` is the Tor SOCKS proxy the caller
+/// resolved for onion servers; an onion address without one is refused
+/// before anything could look the name up.
+fn connect(
+    target: &Target,
+    proxy: Option<&str>,
+    cancel: &Arc<Cancel>,
+) -> Result<Connection, ConnectError> {
+    let (tls_wanted, host, port) = parse(&target.url).map_err(ConnectError::Io)?;
+    let timeout = timeout_for(target);
+
+    // Tor: the .onion address is the server's public key, and the
+    // circuit proves the endpoint holds it. A certificate on top adds
+    // encryption inside an encrypted tunnel and authenticates nothing,
+    // so it is not what is trusted here — the address is.
+    let stream: Box<dyn Stream> = if is_onion(target, &host) {
+        let proxy =
+            proxy.ok_or_else(|| ConnectError::Io(crate::chain::tor::no_route(&target.url)))?;
+        // The embedded proxy asks for credentials; the SOCKS client
+        // takes them apart from the address. The name goes to the proxy
+        // as spelled, and is resolved inside Tor.
+        let (credentials, address) = crate::chain::tor::split_proxy(proxy);
+        let opened = match credentials {
+            Some((username, password)) => Socks5Stream::connect_with_password(
+                address,
+                (host.as_str(), port),
+                username,
+                password,
+                Some(timeout),
+            ),
+            None => Socks5Stream::connect(address, (host.as_str(), port), Some(timeout)),
+        };
+        let socket = opened
+            .map_err(|e| {
+                ConnectError::Io(format!(
+                    "could not connect through Tor: {}",
+                    Fault::of_io(&e, Some(timeout))
+                ))
+            })?
+            .into_inner();
+        let _ = socket.set_nodelay(true);
+        let socket = SharedSocket::new(socket);
+        cancel.hold(&socket)?;
+        if tls_wanted {
+            Box::new(tls::onion_handshake(&host, socket)?)
+        } else {
+            Box::new(socket)
+        }
+    } else {
+        let socket = SharedSocket::new(tls::tcp_connect(&host, port, timeout)?);
+        cancel.hold(&socket)?;
+        if tls_wanted {
+            Box::new(tls::handshake(&host, target.pin.as_deref(), socket)?)
+        } else {
+            Box::new(socket)
+        }
+    };
+    let raw = RawClient::from(Guarded::new(stream, cancel.clone(), MAX_LINE));
+    negotiate(&raw, timeout)?;
+    Ok(raw)
+}
+
+/// `server.version` is the first call an Electrum server expects, and
+/// the one that fixes the protocol version.
+fn negotiate(raw: &Connection, timeout: Duration) -> Result<(), ConnectError> {
+    raw.raw_call(
+        "server.version",
+        vec![
+            Param::String(CLIENT_NAME.to_owned()),
+            Param::StringVec(vec![PROTOCOL.to_owned(), PROTOCOL.to_owned()]),
+        ],
+    )
+    .map(|_| ())
+    .map_err(|e| ConnectError::from(describe(&e, timeout)))
+}
+
+/// Runs `operation` against `target` on a thread of its own, and waits
+/// for it at most `deadline`. Past it, or as soon as the future is
+/// dropped, the connection is shut down: the thread's next read fails
+/// and it ends, whatever the server does.
+async fn run<T: Send + 'static>(
+    target: &Target,
+    proxy: Option<&str>,
+    deadline: Duration,
+    operation: impl FnOnce(&Connection) -> Result<T, Fault> + Send + 'static,
+) -> Result<T, Fault> {
+    let cancel = Arc::new(Cancel::default());
+    let _abort = AbortOnDrop(cancel.clone());
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    let target = target.clone();
+    let proxy = proxy.map(str::to_owned);
+    std::thread::Builder::new()
+        .name("gerfaut-electrum".to_owned())
+        .spawn(move || {
+            PAUSES_LEFT.set(PAUSES);
+            let result = connect(&target, proxy.as_deref(), &cancel)
+                .map_err(Fault::from)
+                .and_then(|raw| operation(&raw));
+            let _ = done.send(result);
+        })
+        .map_err(|e| Fault::other(format!("could not start the connection: {e}")))?;
+    match tokio::time::timeout(deadline, outcome).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(Fault::other("the connection ended unexpectedly")),
+        Err(_) => Err(Fault::other(format!(
+            "no answer within {} s",
+            deadline.as_secs()
+        ))),
+    }
+}
+
+/// The deadline of an operation of a few calls against this server.
+fn call_deadline(target: &Target) -> Duration {
+    if crate::chain::is_onion(&target.url) {
+        TOR_CALL_DEADLINE
+    } else {
+        CALL_DEADLINE
+    }
+}
+
+/// What the settings screen shows about this server's certificate.
+pub(crate) fn inspect_blocking(target: &Target) -> Result<Inspection, String> {
+    let (tls_wanted, host, port) = parse(&target.url)?;
+    if is_onion(target, &host) {
+        return Ok(Inspection::Tor);
+    }
+    if !tls_wanted {
+        return Ok(Inspection::NotTls);
+    }
+    tls::inspect(&host, port, target.pin.as_deref(), TIMEOUT)
+        .map(Inspection::Tls)
+        .map_err(|e| e.to_string())
+}
+
+/// The same, on a thread of its own and within a deadline. The check
+/// opens a connection and closes it: nothing to abort on the way.
+pub(crate) async fn inspect(target: &Target) -> Result<Inspection, String> {
+    let deadline = call_deadline(target);
+    let target = target.clone();
+    let (done, outcome) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("gerfaut-electrum".to_owned())
+        .spawn(move || {
+            let _ = done.send(inspect_blocking(&target));
+        })
+        .map_err(|e| format!("could not start the connection: {e}"))?;
+    match tokio::time::timeout(deadline, outcome).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("the connection ended unexpectedly".to_owned()),
+        Err(_) => Err(format!("no answer within {} s", deadline.as_secs())),
+    }
+}
+
+/// Runs a sync plan on one connection, within `deadline`. What is
+/// asked for, and what is not, is written in the `sync` module.
+pub(crate) async fn sync(
+    target: &Target,
+    plan: super::Plan,
+    proxy: Option<&str>,
+    deadline: Duration,
+) -> Result<super::Synced, Fault> {
+    let fail = failed(target);
+    run(target, proxy, deadline, move |client| {
+        sync::run(client, plan).map_err(fail)
+    })
+    .await
+}
+
+// --- a server out of memory for its answers --------------------------------
+
+/// The shortest wait before a request a server turned down for want of
+/// memory is asked again: the five seconds an Esplora server that limits
+/// the rate of requests is given at least.
+const BUSY_WAIT: Duration = Duration::from_secs(5);
+
+/// Whether an error is the electrs of Blockstream turning a request down
+/// because the answers it holds for all its clients at that moment take
+/// the memory it allows them, 64 MiB by default: code 2, "response budget
+/// exhausted, retry later". Only an answer over 16 KiB is counted, a big
+/// transaction or a long history, and a moment later the same request
+/// may go through. Code 2 also carries the refusals of the node behind
+/// the server, a broadcast it turned down among them, which asking again
+/// would not change: the words tell the two apart.
+pub(crate) fn out_of_budget(error: &serde_json::Value) -> bool {
+    error.get("code").and_then(serde_json::Value::as_i64) == Some(2)
+        && error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.to_ascii_lowercase().contains("budget exhausted"))
+}
+
+/// The waits one connection takes at most for a server out of memory,
+/// fifteen seconds or so. A wallet of a hundred batches under a server
+/// that stays out of memory would otherwise wait for each, past the
+/// deadline of its sync, which relegates nothing, and the next sync
+/// would start over. Past them, a refusal for want of memory is the
+/// answer at once: the sync moves to the next server, and this one is
+/// relegated for it ([`crate::chain::FaultKind::Outage`]).
+pub(crate) const PAUSES: u32 = 3;
+
+std::thread_local! {
+    /// The waits left to the connection of this thread: each operation
+    /// of the client of BDK runs on a thread of its own ([`run`]), which
+    /// starts with [`PAUSES`].
+    static PAUSES_LEFT: std::cell::Cell<u32> = const { std::cell::Cell::new(PAUSES) };
+}
+
+/// The wait before such a request is asked again: [`BUSY_WAIT`], and up
+/// to a fifth more so that the clients turned down together do not come
+/// back together.
+pub(crate) fn busy_pause() -> Duration {
+    BUSY_WAIT.mul_f64(1.0 + 0.2 * rand::random::<f64>())
+}
+
+/// `call`, made once more after [`busy_pause`] when the server turned it
+/// down for want of memory ([`out_of_budget`]), the way an Esplora server
+/// that limits the rate of requests is asked again once: a second
+/// refusal is the answer, and so is the first once the connection has
+/// taken its [`PAUSES`]. The thread of the sync sleeps meanwhile, its
+/// connection open.
+///
+/// A batch of the client of BDK is asked again whole, ten requests at
+/// most: it ends at the first refusal and drops the answers it had, so
+/// nothing tells which ones went through, where the asynchronous client
+/// ([`rpc::Connection::batch`]) asks again the refused ones alone. And it
+/// reads a refusal only from a server that answers in order: one
+/// answered out of order reaches it as a result it cannot read. The
+/// electrs of Blockstream, the one server that refuses for want of
+/// memory, answers the requests of a connection one after the other.
+pub(crate) fn patiently<T>(
+    call: impl FnMut() -> Result<T, electrum_client::Error>,
+) -> Result<T, electrum_client::Error> {
+    patiently_with(call, std::thread::sleep)
+}
+
+fn patiently_with<T>(
+    mut call: impl FnMut() -> Result<T, electrum_client::Error>,
+    pause: impl FnOnce(Duration),
+) -> Result<T, electrum_client::Error> {
+    match call() {
+        Err(electrum_client::Error::Protocol(error)) if out_of_budget(&error) && take_pause() => {
+            pause(busy_pause());
+            call()
+        }
+        other => other,
+    }
+}
+
+/// One of the waits left to the connection of this thread, if any.
+fn take_pause() -> bool {
+    PAUSES_LEFT.with(|left| match left.get() {
+        0 => false,
+        n => {
+            left.set(n - 1);
+            true
+        }
+    })
+}
+
+// --- errors ---------------------------------------------------------------
+
+/// The budget a server gets: onion hosts the longer one.
+fn timeout_for(target: &Target) -> Duration {
+    if crate::chain::is_onion(&target.url) {
+        TOR_TIMEOUT
+    } else {
+        TIMEOUT
+    }
+}
+
+/// The error of a call to `target`, as a sentence, of its kind.
+fn failed(target: &Target) -> impl Fn(electrum_client::Error) -> Fault + use<> {
+    let timeout = timeout_for(target);
+    move |error| describe(&error, timeout)
+}
+
+/// The error as a sentence a person can act on, of the kind its variant
+/// tells. The crate reports every failed call as "made one or multiple
+/// attempts, all errored" over a bulleted list, and an I/O failure in the
+/// operating system's words, error number included.
+///
+/// A refusal is in the server's words, and those choose nothing: it is
+/// an outage only when the server said, by its code, that it is out of
+/// memory for its answers ([`out_of_budget`]). A failure the core raised
+/// inside a call travels as the [`Fault`] it is ([`raised`]).
+fn describe(error: &electrum_client::Error, timeout: Duration) -> Fault {
+    use electrum_client::Error;
+    match error {
+        // The client is left at its default of one attempt, so the list
+        // holds the one failure; the last entry is the freshest anyway.
+        Error::AllAttemptsErrored(errors) => match errors.last() {
+            Some(inner) => describe(inner, timeout),
+            None => Fault::other("request failed"),
+        },
+        Error::IOError(io) => Fault::of_io(io, Some(timeout)),
+        Error::SharedIOError(io) => Fault::of_io(io, Some(timeout)),
+        Error::Protocol(value) => {
+            let refused = format!("the server refused the request: {}", words(value));
+            if out_of_budget(value) {
+                Fault::outage(refused)
+            } else {
+                Fault::other(refused)
+            }
+        }
+        Error::Message(text) => Fault::other(text.clone()),
+        Error::JSON(_) | Error::Hex(_) | Error::Bitcoin(_) | Error::InvalidResponse(_) => {
+            Fault::other("unexpected response")
+        }
+        _ => Fault::other("request failed"),
+    }
+}
+
+/// A failure the core raises inside a call of the client of BDK, whose
+/// errors are the crate's own: carried inside an I/O error, as the
+/// [`Fault`] it is, and taken out again by [`describe`]. A server's
+/// answer never reaches one: it arrives as the crate's
+/// [`electrum_client::Error::Protocol`].
+pub(crate) fn raised(fault: Fault) -> electrum_client::Error {
+    electrum_client::Error::IOError(std::io::Error::other(fault))
+}
+
+/// The message of a JSON-RPC error, as a screen may show it: see
+/// [`crate::chain::server_words`].
+pub(crate) fn words(error: &serde_json::Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_owned);
+    crate::chain::server_words(&message)
+}
+
+// --- broadcast ------------------------------------------------------------
+
+/// Hands a transaction to the server, and returns the txid it answers
+/// with. A server short of memory is asked again once ([`patiently`]).
+pub(crate) async fn broadcast(
+    target: &Target,
+    tx: &Transaction,
+    proxy: Option<&str>,
+) -> Result<Txid, Failure> {
+    let tx = tx.clone();
+    let timeout = timeout_for(target);
+    on_one(target, proxy, move |client| {
+        patiently(|| client.transaction_broadcast(&tx)).map_err(|e| sent_failure(&e, timeout))
+    })
+    .await
+}
+
+/// A broadcast that failed, as [`Failure`] reads it: a refusal only when
+/// the server's error is the node's verdict in one of the forms server
+/// software gives it ([`crate::chain::node_verdict`]); anything else, a
+/// server short of memory, "excessive resource usage", a daemon it cannot
+/// reach, an answer that is not the protocol, is the way there failing.
+fn sent_failure(error: &electrum_client::Error, timeout: Duration) -> Failure {
+    match error {
+        electrum_client::Error::AllAttemptsErrored(errors) => match errors.last() {
+            Some(inner) => sent_failure(inner, timeout),
+            None => failure(error, timeout),
+        },
+        electrum_client::Error::Protocol(value) if !out_of_budget(value) => {
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .map_or_else(|| value.to_string(), str::to_owned);
+            match crate::chain::node_verdict(&message) {
+                Some(words) => Failure::Refused(words),
+                None => failure(error, timeout),
+            }
+        }
+        _ => failure(error, timeout),
+    }
+}
+
+/// `operation`, its own failures as it says them, and the connection's
+/// as failures of the way there.
+async fn on_one<T: Send + 'static>(
+    target: &Target,
+    proxy: Option<&str>,
+    operation: impl FnOnce(&Connection) -> Result<T, Failure> + Send + 'static,
+) -> Result<T, Failure> {
+    run(target, proxy, call_deadline(target), move |client| {
+        Ok(operation(client))
+    })
+    .await
+    .unwrap_or_else(|fault| Err(Failure::Transport(fault)))
+}
+
+/// A failed call that is no broadcast, a lookup or the tip, as the
+/// endpoints of a transaction to send read it: nothing such a call gets
+/// back is the node's verdict on a transaction, so whatever fails is the
+/// way there failing, and the next endpoint may be asked.
+fn failure(error: &electrum_client::Error, timeout: Duration) -> Failure {
+    Failure::Transport(describe(error, timeout))
+}
+
+/// Whether an error says the server has no such transaction, in the
+/// words of the servers there are: Fulcrum, ElectrumX and electrs pass
+/// on the node's "No such mempool or blockchain transaction", the electrs
+/// of Blockstream and mempool.space say "missing transaction" or "not
+/// found". Any other refusal is not that.
+fn no_such_transaction(error: &electrum_client::Error) -> bool {
+    match error {
+        electrum_client::Error::AllAttemptsErrored(errors) => {
+            errors.last().is_some_and(no_such_transaction)
+        }
+        electrum_client::Error::Protocol(value) => {
+            let words = words(value).to_ascii_lowercase();
+            [
+                "no such mempool or blockchain transaction",
+                "missing transaction",
+                "not found",
+            ]
+            .iter()
+            .any(|phrase| words.contains(phrase))
+        }
+        _ => false,
+    }
+}
+
+/// The transaction `txid` as the server holds it, `None` when it says it
+/// has no such transaction.
+pub(crate) async fn fetch_tx(
+    target: &Target,
+    txid: Txid,
+    proxy: Option<&str>,
+) -> Result<Option<Transaction>, Failure> {
+    let timeout = timeout_for(target);
+    on_one(target, proxy, move |client| {
+        match patiently(|| client.transaction_get(&txid)) {
+            Ok(tx) => Ok(Some(tx)),
+            Err(error) if no_such_transaction(&error) => Ok(None),
+            Err(error) => Err(failure(&error, timeout)),
+        }
+    })
+    .await
+}
+
+/// Transactions of a script's history read, at most, to find the one
+/// that spends a coin: an address used over and over has a history no
+/// preview should download, and past this the coin is said to be spent
+/// by a transaction the server did not show.
+const SPENDER_LOOKUPS: usize = 32;
+
+/// The output an input spends, and whether it is spent. Electrum has no
+/// "is it spent" call: the coins of the output's script say whether it
+/// is still there, and when it is not, the script's history holds the
+/// transaction that spends it, which is read, its txid checked, to see
+/// it does. The same server, about a script it already knows from the
+/// transaction it just served: nobody new learns anything.
+///
+/// Every coin of a preview goes over one connection, in turn: a
+/// consolidation of dozens of inputs costs one handshake, not one each.
+/// The facts of the coins answered about, in order, and the failure that
+/// stopped the rest, if one did: those go to the next endpoint.
+pub(crate) async fn fetch_prevouts(
+    target: &Target,
+    outpoints: Vec<OutPoint>,
+    proxy: Option<&str>,
+) -> (Vec<crate::chain::PrevoutFacts>, Option<Failure>) {
+    let timeout = timeout_for(target);
+    // A few calls a coin, each a round trip, and a wait when the server
+    // is short of memory: room for a large consolidation.
+    let deadline = call_deadline(target).saturating_mul(1 + outpoints.len() as u32 / 8);
+    let answered = run(target, proxy, deadline, move |client| {
+        let mut facts = Vec::with_capacity(outpoints.len());
+        for outpoint in outpoints {
+            match prevout_on(client, outpoint, timeout) {
+                Ok(fact) => facts.push(fact),
+                Err(failure) => return Ok((facts, Some(failure))),
+            }
+        }
+        Ok((facts, None))
+    })
+    .await;
+    answered.unwrap_or_else(|fault| (Vec::new(), Some(Failure::Transport(fault))))
+}
+
+/// One coin, on a connection already open: see [`fetch_prevouts`].
+fn prevout_on(
+    client: &Connection,
+    outpoint: OutPoint,
+    timeout: Duration,
+) -> Result<crate::chain::PrevoutFacts, Failure> {
+    // Only a server that says it has no such transaction says the coin
+    // is unknown; anything else that fails is the way there failing, and
+    // one short of memory is asked again first.
+    let txout = match patiently(|| client.transaction_get(&outpoint.txid)) {
+        Ok(tx) => crate::chain::output_at(&tx, outpoint).map_err(Failure::Transport)?,
+        Err(error) if no_such_transaction(&error) => None,
+        Err(error) => return Err(failure(&error, timeout)),
+    };
+    let (spent, spent_by) = match &txout {
+        Some(txout) => spent_status(client, outpoint, &txout.script_pubkey),
+        None => (None, None),
+    };
+    Ok(crate::chain::PrevoutFacts {
+        txout,
+        spent,
+        spent_by,
+    })
+}
+
+/// Whether the coin at `outpoint`, on `script`, is spent, and by what.
+/// Anything the server refuses or fails to say leaves the question open:
+/// the coin is then neither spent nor unspent, and nothing holds the
+/// broadcast back.
+fn spent_status(
+    client: &Connection,
+    outpoint: OutPoint,
+    script: &bdk_wallet::bitcoin::Script,
+) -> (Option<bool>, Option<crate::broadcast::SpentBy>) {
+    let Ok(coins) = patiently(|| client.script_list_unspent(script)) else {
+        return (None, None);
+    };
+    if coins
+        .iter()
+        .any(|coin| coin.tx_hash == outpoint.txid && coin.tx_pos == outpoint.vout as usize)
+    {
+        return (Some(false), None);
+    }
+    let Ok(history) = patiently(|| client.script_get_history(script)) else {
+        return (None, None);
+    };
+    // Only what came at the coin's height or after can spend it: in the
+    // same block or a later one once it is confirmed, in the mempool in
+    // any case. The newest first: a coin a preview finds spent is most
+    // often spent by the transaction pasted, just sent, or by the one it
+    // replaces.
+    let funded = history
+        .iter()
+        .find(|entry| entry.tx_hash == outpoint.txid)
+        .map(|entry| entry.height);
+    let candidates: Vec<(Txid, i32)> = history
+        .iter()
+        .rev()
+        .filter(|entry| entry.tx_hash != outpoint.txid)
+        .filter(|entry| match funded {
+            Some(funded) if funded > 0 => entry.height <= 0 || entry.height >= funded,
+            Some(_) => entry.height <= 0,
+            None => true,
+        })
+        .map(|entry| (entry.tx_hash, entry.height))
+        .collect();
+    let read = candidates.len().min(SPENDER_LOOKUPS);
+    let Ok(txs) =
+        patiently(|| client.batch_transaction_get(candidates[..read].iter().map(|(txid, _)| txid)))
+    else {
+        return (None, None);
+    };
+    for (tx, (txid, height)) in txs.iter().zip(&candidates) {
+        if crate::chain::spends(tx, *txid, outpoint) {
+            return (
+                Some(true),
+                Some(crate::broadcast::SpentBy {
+                    txid: *txid,
+                    // 0 and -1 are the mempool, the latter with a parent
+                    // there too.
+                    confirmed: *height > 0,
+                    verified: true,
+                }),
+            );
+        }
+    }
+    if read < candidates.len() {
+        // Not among its coins, and a history too long to read through:
+        // spent, by a transaction this preview does not name.
+        return (Some(true), None);
+    }
+    // Not among its coins, and nothing in its history spends it: the two
+    // answers disagree, and neither is taken.
+    (None, None)
+}
+
+/// The height of the server's tip, proven as a sync's is
+/// ([`proven_tip`]).
+pub(crate) async fn tip_height(
+    target: &Target,
+    network: crate::network::Network,
+    proxy: Option<&str>,
+) -> Result<u32, Failure> {
+    let fail = failed(target);
+    run(target, proxy, call_deadline(target), move |client| {
+        proven_tip(client, network, &fail)
+    })
+    .await
+    .map_err(Failure::Transport)
+}
+
+/// The server's tip, refused past any height a chain of `network` can
+/// have reached and in a header without the work of its height
+/// ([`crate::chain::checked_tip`]), its height proven by its coinbase
+/// ([`sync::prove_height`]). Without the last, a server served a real
+/// recent block at whatever height it liked.
+fn proven_tip(
+    client: &Connection,
+    network: crate::network::Network,
+    fail: &impl Fn(electrum_client::Error) -> Fault,
+) -> Result<u32, Fault> {
+    let announced = patiently(|| client.block_headers_subscribe()).map_err(fail)?;
+    let height =
+        u32::try_from(announced.height).map_err(|_| Fault::other(crate::chain::IMPOSSIBLE_TIP))?;
+    let tip = crate::chain::checked_tip(network, height, &announced.header)?;
+    let proof = sync::prove_height(client, network, tip, &announced.header).map_err(fail)?;
+    crate::chain::proof::height::tip_proven(proof)?;
+    Ok(tip)
+}
+
+/// Where a transaction stands, read off the history of one of its
+/// output scripts, `scripts` in the order they are tried: height 0
+/// means mempool, a height means confirmed, absence means the server
+/// does not have it. A script whose history the server refuses, one too
+/// long for it, is passed over for the next.
+///
+/// A confirmation counts once proven, as a sync's: its merkle branch
+/// against the header of its block ([`crate::chain::proof`]). A proof
+/// that does not hold refuses the server; one that cannot be had leaves
+/// the transaction waiting.
+pub(crate) async fn tx_standing(
+    target: &Target,
+    network: crate::network::Network,
+    txid: Txid,
+    scripts: Vec<ScriptBuf>,
+    proxy: Option<&str>,
+) -> Result<(bool, Option<u32>, u32), Fault> {
+    let fail = failed(target);
+    run(target, proxy, call_deadline(target), move |client| {
+        let tip = proven_tip(client, network, &fail)?;
+        let mut refused = None;
+        for script in &scripts {
+            // A server short of memory is asked again first: the next
+            // script is for one that refuses this script's history.
+            let history = match patiently(|| client.script_get_history(script)) {
+                Ok(history) => history,
+                Err(error @ electrum_client::Error::Protocol(_)) => {
+                    refused = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(fail(error)),
+            };
+            let entry = history.iter().find(|entry| entry.tx_hash == txid);
+            return Ok(match entry {
+                None => (false, None, tip),
+                Some(entry) if entry.height > 0 => {
+                    let height = entry.height as u32;
+                    let proven = proven_on(client, network, txid, height, tip, &fail)?;
+                    (true, proven.then_some(height), tip)
+                }
+                Some(_) => (true, None, tip),
+            });
+        }
+        Err(refused.map_or_else(|| Fault::other("the transaction creates nothing"), fail))
+    })
+    .await
+}
+
+/// Whether the server proves that `txid` confirmed at `height`, its tip
+/// at `tip`: see [`crate::chain::proof::check_confirmation`]. `false`
+/// when it is unsure, a block come in since or no branch to be had; an
+/// error, the server's false proof.
+fn proven_on(
+    client: &Connection,
+    network: crate::network::Network,
+    txid: Txid,
+    height: u32,
+    tip: u32,
+    fail: &impl Fn(electrum_client::Error) -> Fault,
+) -> Result<bool, Fault> {
+    use crate::chain::proof::{
+        Proof, above_the_tip, chain_to_checkpoint, chained, chains_to_read, check_confirmation,
+        checkpoint_for, recheck,
+    };
+    match above_the_tip(height, tip) {
+        Some(Proof::False) => return Err(Fault::false_proof()),
+        Some(_) => return Ok(false),
+        None => {}
+    }
+    let Ok(branch) = patiently(|| client.transaction_get_merkle(&txid, height as usize)) else {
+        return Ok(false);
+    };
+    let header = patiently(|| client.block_header(height as usize)).map_err(fail)?;
+    let proof = match check_confirmation(network, height, &header, txid, &branch) {
+        Proof::Elsewhere => {
+            let again = patiently(|| client.block_header(height as usize)).map_err(fail)?;
+            recheck(network, height, &header, &again, txid, &branch)
+        }
+        verdict => verdict,
+    };
+    match proof {
+        Proof::Holds => {}
+        Proof::Unsure => return Ok(false),
+        Proof::False | Proof::Elsewhere => return Err(Fault::false_proof()),
+    }
+    // A block of an early period of the chain, whose header costs little
+    // to forge, holds only once chained to the checkpoint that ends its
+    // period, as a sync's ([`crate::chain::proof::chained`]).
+    let hash = header.block_hash();
+    let mut read = std::collections::HashMap::new();
+    for (from, count) in chains_to_read(network, &[(height, hash)]) {
+        let Some(headers) = sync::headers_from(client, from, count).map_err(fail)? else {
+            continue;
+        };
+        let hashes = chain_to_checkpoint(network, from, &headers).ok_or_else(Fault::false_proof)?;
+        read.insert(from, hashes);
+    }
+    let proof = match chained(network, height, hash, &read) {
+        // Past the checkpoints, the block's height is its coinbase's.
+        Proof::Holds if checkpoint_for(network, height).is_none() => {
+            sync::prove_height(client, network, height, &header).map_err(fail)?
+        }
+        verdict => verdict,
+    };
+    match proof {
+        Proof::Holds => Ok(true),
+        Proof::Unsure => Ok(false),
+        Proof::False | Proof::Elsewhere => Err(Fault::false_proof()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead, BufReader, Cursor};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A transaction is looked up through one of its scripts: one a coin
+    /// may sit on before an OP_RETURN, and past one whose history the
+    /// server refuses, an exchange's deposit address for instance, the
+    /// next one.
+    #[tokio::test]
+    async fn a_transaction_is_found_past_a_script_the_server_refuses() {
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(
+            &[nowhere(1, 0)],
+            &[
+                ("6a0474657374", 0),
+                (&script(1), 1_000),
+                (&script(2), 2_000),
+                (&script(1), 3_000),
+            ],
+        );
+        let scripts = crate::chain::lookup_scripts(&tx);
+        let hex: Vec<String> = scripts.iter().map(|s| s.to_hex_string()).collect();
+        assert_eq!(hex, [script(1), script(2), "6a0474657374".to_owned()]);
+        server.set_history(&script(2), &[(tx.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .refused_histories
+            .insert(scripthash(&script(1)));
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = tx_standing(
+            &target,
+            crate::network::Network::Signet,
+            tx.compute_txid(),
+            scripts,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(standing, (true, Some(90), 100));
+    }
+
+    /// ElectrumX holds small answers back until a kilobyte of them
+    /// waits, or a second has passed: a sync asks for a list it knows in
+    /// full in few batches, so that it waits that second a few times,
+    /// not once every ten scripts.
+    #[tokio::test]
+    async fn a_sync_waits_little_on_a_server_that_holds_answers_back() {
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::{FakeElectrum, script};
+        let server = FakeElectrum::start().await;
+        server.state.lock().unwrap().hold = Some((1024, Duration::from_millis(50)));
+        let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+        let plan = crate::chain::Plan {
+            network: crate::network::Network::Signet,
+            tip: CheckPoint::new(BlockId {
+                height: 0,
+                hash: genesis,
+            }),
+            start_time: 0,
+            scripts: (0..200)
+                .map(|n| ScriptBuf::from_hex(&script(n)).unwrap())
+                .collect(),
+            scans: Vec::new(),
+            stop_gap: 20,
+            reading: crate::chain::Reading::Complete,
+            held: crate::chain::Held::default(),
+            told: None,
+        };
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        sync(&target, plan, None, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let waits = server.state.lock().unwrap().timed_flushes;
+        assert!(waits < 10, "{waits} waits");
+    }
+
+    /// A keychain is walked as many scripts at a time as the gap, within
+    /// bounds, and never past it: with nothing on it, the gap of twenty
+    /// is one batch, and a gap of three a batch of three.
+    #[tokio::test]
+    async fn a_keychain_is_walked_a_gap_at_a_time() {
+        use bdk_wallet::KeychainKind;
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::FakeElectrum;
+        for (stop_gap, batch) in [(20, 20), (3, 3), (500, 50)] {
+            let server = FakeElectrum::start().await;
+            server.state.lock().unwrap().hold = Some((usize::MAX, Duration::from_millis(20)));
+            let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+            let spks = (0u32..).map(|i| {
+                let script = format!("0014{i:04x}{}", "cd".repeat(18));
+                (i, ScriptBuf::from_hex(&script).unwrap())
+            });
+            let plan = crate::chain::Plan {
+                network: crate::network::Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: 0,
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: KeychainKind::External,
+                    spks: Box::new(spks),
+                }],
+                stop_gap,
+                reading: crate::chain::Reading::Complete,
+                held: crate::chain::Held::default(),
+                told: None,
+            };
+            let target = Target::new(format!("tcp://{}", server.address), None);
+            sync(&target, plan, None, Duration::from_secs(60))
+                .await
+                .unwrap();
+            let state = server.state.lock().unwrap();
+            assert_eq!(state.held_most, batch, "gap {stop_gap}");
+            let read = state
+                .asked
+                .iter()
+                .filter(|method| *method == "blockchain.scripthash.get_history")
+                .count();
+            assert_eq!(read, stop_gap as usize, "gap {stop_gap}");
+        }
+    }
+
+    /// The server hears of the gap past the last address used, and of no
+    /// address further: the last batch of a walk is cut to the unused
+    /// addresses that complete the gap. A used address at the head of a
+    /// batch costs a batch of one.
+    #[tokio::test]
+    async fn a_keychain_walk_shows_the_server_the_gap_and_no_more() {
+        use bdk_wallet::KeychainKind;
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        fn walked(i: u32) -> String {
+            format!("0014{i:04x}{}", "cd".repeat(18))
+        }
+        // The addresses used, the gap, and the addresses the server hears
+        // of: before the cut, 60 for the second, 40 for the third.
+        let cases: [(&[u32], u32, u32); 6] = [
+            (&[], 20, 20),
+            (&[0, 20], 20, 41),
+            (&[5], 20, 26),
+            (&[19], 20, 40),
+            (&[], 3, 3),
+            (&[2], 3, 6),
+        ];
+        for (used, stop_gap, heard) in cases {
+            let server = FakeElectrum::start().await;
+            for &index in used {
+                let parent = transaction(&[nowhere(1, index)], &[(&script(9), 2_000)]);
+                let payment = transaction(
+                    &[OutPoint::new(parent.compute_txid(), 0)],
+                    &[(&walked(index), 1_000)],
+                );
+                server.add_tx(&parent);
+                server.add_tx(&payment);
+                server.set_history(&walked(index), &[(payment.compute_txid(), 0)]);
+            }
+            let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+            let spks = (0u32..).map(|i| (i, ScriptBuf::from_hex(&walked(i)).unwrap()));
+            let plan = crate::chain::Plan {
+                network: crate::network::Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: 0,
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: KeychainKind::External,
+                    spks: Box::new(spks),
+                }],
+                stop_gap,
+                reading: crate::chain::Reading::Complete,
+                held: crate::chain::Held::default(),
+                told: None,
+            };
+            let target = Target::new(format!("tcp://{}", server.address), None);
+            let synced = sync(&target, plan, None, Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(
+                synced
+                    .update
+                    .last_active_indices
+                    .get(&KeychainKind::External),
+                used.last(),
+                "{used:?}"
+            );
+            let index_of: std::collections::HashMap<String, u32> =
+                (0..1000).map(|i| (scripthash(&walked(i)), i)).collect();
+            let asked: Vec<u32> = server
+                .state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .filter(|(method, _)| method == "blockchain.scripthash.get_history")
+                .map(|(_, hash)| index_of[hash])
+                .collect();
+            assert_eq!(
+                asked,
+                (0..heard).collect::<Vec<_>>(),
+                "{used:?}, gap {stop_gap}"
+            );
+            let last_used = used.last().map_or(0, |last| last + 1);
+            assert_eq!(heard - last_used, stop_gap, "{used:?}");
+        }
+    }
+
+    fn out_of_memory() -> electrum_client::Error {
+        electrum_client::Error::Protocol(serde_json::json!({
+            "code": 2, "message": "response budget exhausted, retry later",
+        }))
+    }
+
+    /// The electrs of Blockstream turns a request down for want of memory
+    /// with code 2 and words that say so. The same code in the words of
+    /// the node, a broadcast it refused, is not that, and neither is code
+    /// 1, an answer too long or a history too large.
+    #[test]
+    fn a_server_out_of_memory_is_told_by_its_code_and_its_words() {
+        use serde_json::json;
+        let electrum_client::Error::Protocol(busy) = out_of_memory() else {
+            unreachable!()
+        };
+        assert!(out_of_budget(&busy));
+        assert!(out_of_budget(&json!({
+            "code": 2, "message": "batch response budget exhausted; not executed",
+        })));
+        assert!(!out_of_budget(&json!({
+            "code": 2, "message": "sendrawtransaction RPC error -26: min relay fee not met",
+        })));
+        assert!(!out_of_budget(&json!({
+            "code": 1, "message": "response line exceeds max_response_bytes",
+        })));
+        assert!(!out_of_budget(&json!({ "code": 2 })));
+    }
+
+    /// A request turned down for want of memory is made once more, five
+    /// seconds later and up to a fifth more, and its second answer is
+    /// the answer, a second refusal included. Any other error is the
+    /// answer at once.
+    #[test]
+    fn a_request_turned_down_for_memory_is_made_once_more() {
+        let mut calls = 0;
+        let mut paused = None;
+        let answer = patiently_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(out_of_memory())
+                } else {
+                    Ok(7)
+                }
+            },
+            |pause| paused = Some(pause),
+        );
+        assert_eq!(answer.unwrap(), 7);
+        assert_eq!(calls, 2);
+        let paused = paused.unwrap();
+        assert!(
+            paused >= BUSY_WAIT && paused <= BUSY_WAIT.mul_f64(1.2),
+            "{paused:?}"
+        );
+
+        let mut calls = 0;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(out_of_memory())
+            },
+            |_| {},
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            describe(&refused.unwrap_err(), TIMEOUT),
+            "the server refused the request: response budget exhausted, retry later"
+        );
+
+        let mut calls = 0;
+        let mut waited = false;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(electrum_client::Error::Protocol(serde_json::json!({
+                    "code": 1, "message": "Too many history entries",
+                })))
+            },
+            |_| waited = true,
+        );
+        assert!(refused.is_err());
+        assert_eq!((calls, waited), (1, false));
+    }
+
+    /// A connection waits for a server out of memory three times at most:
+    /// past them, the refusal is the answer at once, and the sync moves
+    /// on instead of waiting out its deadline batch after batch.
+    #[test]
+    fn a_connection_waits_three_times_at_most() {
+        PAUSES_LEFT.set(PAUSES);
+        let mut waits = 0;
+        for _ in 0..PAUSES {
+            let mut calls = 0;
+            let answer = patiently_with(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(out_of_memory())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| waits += 1,
+            );
+            assert!(answer.is_ok());
+        }
+        assert_eq!(waits, PAUSES);
+        let mut calls = 0;
+        let refused = patiently_with(
+            || {
+                calls += 1;
+                Err::<(), _>(out_of_memory())
+            },
+            |_| waits += 1,
+        );
+        assert!(refused.is_err());
+        assert_eq!((calls, waits), (1, PAUSES));
+    }
+
+    /// A connection that fails is an outage, told by the kind of its error
+    /// ([`crate::chain::IoOutage`]), and so is a server out of memory
+    /// twice in a row; another refusal is not, whatever its words. A
+    /// failure the core raised inside a call comes out as the fault it is.
+    #[test]
+    fn connections_that_fail_are_outages() {
+        use std::io::{Error, ErrorKind};
+        let io = |error: Error| describe(&electrum_client::Error::IOError(error), TIMEOUT);
+        for kind in [
+            ErrorKind::TimedOut,
+            ErrorKind::WouldBlock,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::UnexpectedEof,
+        ] {
+            let detail = io(Error::from(kind));
+            assert!(detail.is_outage(), "{kind:?}: {detail}");
+        }
+        let unknown = io(Error::other("failed to lookup address information"));
+        assert_eq!(unknown, "host not found");
+        assert!(unknown.is_outage());
+        // The words of this device's system, a firewall that says no:
+        // nothing tells that it is the server.
+        let local = io(Error::other("no route"));
+        assert_eq!(local, "connection failed: no route");
+        assert!(!local.is_outage());
+        assert!(describe(&out_of_memory(), TIMEOUT).is_outage());
+        for words in [
+            "Too many history entries",
+            "request timed out",
+            "could not connect",
+            crate::chain::proof::FALSE_PROOF,
+        ] {
+            let refused = describe(
+                &electrum_client::Error::Protocol(serde_json::json!({
+                    "code": 1, "message": words,
+                })),
+                TIMEOUT,
+            );
+            assert_eq!(refused.kind(), crate::chain::FaultKind::Other, "{refused}");
+        }
+        let raised = describe(&raised(Fault::false_proof()), TIMEOUT);
+        assert!(raised.is_false_proof(), "{raised}");
+        assert_eq!(raised, crate::chain::proof::FALSE_PROOF);
+        let message = electrum_client::Error::Message(crate::chain::proof::FALSE_PROOF.to_owned());
+        assert!(!describe(&message, TIMEOUT).is_false_proof());
+    }
+
+    /// A sync whose server turns transactions down for want of memory,
+    /// the electrs of Blockstream under load, waits and asks for them
+    /// again on its connection, and reads the wallet there: before, the
+    /// sync failed over to the next server of the rotation, another
+    /// operator.
+    #[tokio::test]
+    async fn a_sync_turned_down_for_memory_asks_again_and_reads_the_wallet() {
+        use crate::testkit::{FakeElectrum, nowhere, transaction};
+        const WALLET: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+        let server = FakeElectrum::start().await;
+        let receive = bdk_wallet::Wallet::create_single(WALLET.to_owned())
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap()
+            .peek_address(bdk_wallet::KeychainKind::External, 0)
+            .script_pubkey()
+            .to_hex_string();
+        let parent = transaction(&[nowhere(1, 0)], &[(&crate::testkit::script(9), 11_000)]);
+        let payment = transaction(
+            &[OutPoint::new(parent.compute_txid(), 0)],
+            &[(&receive, 10_000)],
+        );
+        server.add_tx(&parent);
+        server.add_tx(&payment);
+        server.set_history(&receive, &[(payment.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .busy
+            .insert("blockchain.transaction.get", 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let manager =
+            crate::WalletManager::open(dir.path(), crate::store::VaultKey::Raw([7; 32])).unwrap();
+        manager
+            .set_backend(crate::network::Network::Signet, server.backend())
+            .await
+            .unwrap();
+        let wallet = manager
+            .add_wallet(
+                "Cold",
+                &crate::input::parse_input(WALLET).unwrap(),
+                crate::network::Network::Signet,
+            )
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let report = manager.sync_wallet(&wallet.id).await.unwrap();
+        assert!(started.elapsed() >= BUSY_WAIT);
+        assert_eq!(report.balance.confirmed, 10_000);
+        let asked = server.state.lock().unwrap().asked.clone();
+        let fetched = asked
+            .iter()
+            .filter(|method| *method == "blockchain.transaction.get")
+            .count();
+        // The payment twice, then the coin it spends.
+        assert_eq!(fetched, 3, "{asked:?}");
+    }
+
+    /// A server that answers `server.version`, then starts its answer
+    /// to the next request and never finishes it. It says when that
+    /// request arrived, and when the client closed the connection.
+    ///
+    /// Only a client that opens with the `server.version` of this crate
+    /// counts: the port may be one another test just closed, and a
+    /// client of that test, still trying it, is turned away.
+    fn stalling_server() -> (String, mpsc::Receiver<&'static str>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (seen, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut writer, mut lines) = loop {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let writer = stream.try_clone().unwrap();
+                let mut lines = BufReader::new(stream);
+                let mut hello = String::new();
+                let _ = lines.read_line(&mut hello);
+                if hello.contains("server.version") && hello.contains(CLIENT_NAME) {
+                    let _ = lines.get_ref().set_read_timeout(None);
+                    break (writer, lines);
+                }
+            };
+            let _ =
+                writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":[\"fake\",\"1.4\"]}\n");
+            let mut line = String::new();
+            let _ = lines.read_line(&mut line);
+            let _ = seen.send("asked");
+            let _ = writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"height\":");
+            // Held until the client goes: a read then ends one way or
+            // the other.
+            let mut rest = [0u8; 64];
+            while matches!(lines.get_mut().read(&mut rest), Ok(n) if n > 0) {}
+            let _ = seen.send("closed");
+        });
+        (url, heard)
+    }
+
+    /// What the server says next. It runs on a thread of its own, which
+    /// a machine busy with the rest of the suite may be slow to wake:
+    /// the bounds that matter are asserted on the client side.
+    fn within(heard: &mpsc::Receiver<&'static str>, what: &'static str) {
+        assert_eq!(
+            heard.recv_timeout(Duration::from_secs(10)).ok(),
+            Some(what),
+            "the server never saw the client {what}"
+        );
+    }
+
+    /// A call is held to its deadline however the server stalls, and
+    /// the connection is shut down when it runs out: the thread does
+    /// not go on reading.
+    ///
+    /// The clock of the runtime stands still until the server has the
+    /// request, and only then moves on to the deadline: however long a
+    /// machine busy with the rest of the suite takes to connect and ask,
+    /// the deadline runs out on a call that is waiting on the server,
+    /// and the call ends at the deadline to the millisecond.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_call_is_abandoned_at_its_deadline() {
+        let (url, heard) = stalling_server();
+        let deadline = Duration::from_secs(2);
+        // A blocking task holds a paused clock where it is while it runs.
+        let asked = tokio::task::spawn_blocking(move || {
+            within(&heard, "asked");
+            heard
+        });
+        let target = Target::new(url, None);
+        let started = tokio::time::Instant::now();
+        let call = run(&target, None, deadline, |client| {
+            client
+                .block_headers_subscribe()
+                .map_err(|e| describe(&e, TIMEOUT))
+        });
+        let (outcome, heard) = tokio::join!(call, asked);
+        let heard = heard.expect("the server never saw the request");
+        assert_eq!(
+            outcome.err().as_ref().map(Fault::detail),
+            Some("no answer within 2 s")
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= deadline && waited <= deadline + Duration::from_millis(1),
+            "the call ended after {waited:?}"
+        );
+        within(&heard, "closed");
+    }
+
+    /// Abandoned, a connection is shut down on the socket it reads from,
+    /// at once, every time: the server sees it go while the thread still
+    /// waits on its read. Each socket comes out of a timed connect and is
+    /// held at once, the way a call holds it; on Windows a copy of such a
+    /// socket, the handle this used to keep, at times refused the
+    /// shutdown, and the server then waited for the read timeout.
+    #[test]
+    fn an_abandoned_connection_is_shut_down_at_once() {
+        // A read the shutdown does not wake, on Windows, ends at this.
+        const READ_TIMEOUT: Duration = Duration::from_secs(2);
+        let mut readers = Vec::new();
+        for round in 0..100 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let cancel = Arc::new(Cancel::default());
+            let socket = SharedSocket::new(
+                tls::tcp_connect("127.0.0.1", address.port(), READ_TIMEOUT).unwrap(),
+            );
+            cancel.hold(&socket).unwrap();
+            let (mut accepted, _) = listener.accept().unwrap();
+            let mut reader = Guarded::new(Box::new(socket), cancel.clone(), MAX_LINE);
+            readers.push(std::thread::spawn(move || {
+                reader.read(&mut [0u8; 8]).map(|_| ())
+            }));
+            // The read is under way, or about to be: either way it ends.
+            std::thread::sleep(Duration::from_millis(round % 3));
+            cancel.abort();
+            accepted
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let seen = accepted.read(&mut [0u8; 8]);
+            assert!(
+                matches!(seen, Ok(0) | Err(_)),
+                "round {round}: the server read {seen:?}"
+            );
+            if let Err(error) = &seen {
+                assert!(
+                    !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                    "round {round}: the server never saw the connection go"
+                );
+            }
+        }
+        for reader in readers {
+            let _ = reader.join().unwrap();
+        }
+    }
+
+    /// The call runs on a thread of its own, not on the blocking pool: a
+    /// runtime dropped while it waits on a server does not wait with it,
+    /// and dropping its future closes the connection.
+    #[test]
+    fn a_runtime_shutdown_never_waits_on_an_electrum_call() {
+        let (url, heard) = stalling_server();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.spawn(async move {
+            let _ = run(
+                &Target::new(url, None),
+                None,
+                Duration::from_secs(3600),
+                |client| {
+                    client
+                        .block_headers_subscribe()
+                        .map_err(|e| describe(&e, TIMEOUT))
+                },
+            )
+            .await;
+        });
+        within(&heard, "asked");
+        let dropped = Instant::now();
+        drop(runtime);
+        assert!(
+            dropped.elapsed() < Duration::from_secs(2),
+            "the runtime waited {:?}",
+            dropped.elapsed()
+        );
+        within(&heard, "closed");
+    }
+
+    /// Against a server that answers, the same path carries a call.
+    #[tokio::test]
+    async fn a_call_goes_through_the_guarded_connection() {
+        let server = crate::testkit::FakeElectrum::start().await;
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        run(&target, None, Duration::from_secs(10), |client| {
+            client.ping().map_err(|e| describe(&e, TIMEOUT))
+        })
+        .await
+        .unwrap();
+    }
+
+    /// An onion server is reached through the proxy, by name, with the
+    /// proxy's credentials; nothing looks the name up on the way.
+    #[tokio::test]
+    async fn an_onion_server_is_reached_through_the_proxy_by_name() {
+        use crate::chain::tor::socks;
+        const ONION: &str = "gerfautexample000000000000000000000000000000000000000.onion";
+        let server = crate::testkit::FakeElectrum::start().await;
+        let upstream = server.address;
+        let asked: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
+        let (listener, address) = socks::bind().await.unwrap();
+        let seen = asked.clone();
+        tokio::spawn(socks::serve(
+            listener,
+            socks::Credentials::new("user", "pass"),
+            move |host, port| {
+                seen.lock().unwrap().push((host, port));
+                async move { tokio::net::TcpStream::connect(upstream).await }
+            },
+        ));
+        let target = Target::new(format!("tcp://{ONION}:50001"), None);
+        let proxy = format!("user:pass@{address}");
+        run(&target, Some(&proxy), Duration::from_secs(10), |client| {
+            client.ping().map_err(|e| describe(&e, TIMEOUT))
+        })
+        .await
+        .unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec![(ONION.to_owned(), 50001)]);
+        // Without a route, nothing is opened at all.
+        let refused = run(&target, None, Duration::from_secs(10), |_| Ok(())).await;
+        assert!(refused.unwrap_err().starts_with("tor: "));
+    }
+
+    /// An in-memory stream, for the reader on its own.
+    struct Memory(Cursor<Vec<u8>>);
+
+    impl Read for Memory {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Memory {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line past the limit is refused as it arrives, not buffered
+    /// whole; lines within it go through; an abandoned call reads
+    /// nothing more.
+    #[test]
+    fn a_line_past_the_limit_is_cut_off() {
+        let mut data = b"short\n".to_vec();
+        data.extend(std::iter::repeat_n(b'x', 64 * 1024));
+        let cancel = Arc::new(Cancel::default());
+        let guarded = Guarded::new(
+            Box::new(Memory(Cursor::new(data))),
+            cancel.clone(),
+            16 * 1024,
+        );
+        let mut reader = BufReader::with_capacity(1024, guarded);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "short\n");
+        line.clear();
+        let error = reader.read_line(&mut line).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            Fault::of_io(&error, Some(TIMEOUT)),
+            "the server sent an answer longer than 0 MiB"
+        );
+        assert!(line.len() <= 16 * 1024 + 1024, "{} bytes held", line.len());
+
+        let cancel = Arc::new(Cancel::default());
+        let mut guarded = Guarded::new(
+            Box::new(Memory(Cursor::new(b"line\n".to_vec()))),
+            cancel.clone(),
+            MAX_LINE,
+        );
+        cancel.abort();
+        let error = guarded.read(&mut [0u8; 8]).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert!(guarded.write(b"x").is_err());
+    }
+
+    #[test]
+    fn an_address_splits_into_transport_host_and_port() {
+        assert_eq!(
+            parse("ssl://electrum.example:50002").unwrap(),
+            (true, "electrum.example".to_owned(), 50002)
+        );
+        assert_eq!(
+            parse("tcp://192.168.1.10:50001").unwrap(),
+            (false, "192.168.1.10".to_owned(), 50001)
+        );
+        // No scheme means TLS, the Electrum convention.
+        assert_eq!(
+            parse("electrum.example:51002").unwrap(),
+            (true, "electrum.example".to_owned(), 51002)
+        );
+        // No port means the protocol default, per transport.
+        assert_eq!(parse("ssl://host").unwrap().2, SSL_PORT);
+        assert_eq!(parse("tcp://host").unwrap().2, TCP_PORT);
+        // An IPv6 literal keeps its own colons.
+        assert_eq!(
+            parse("ssl://[2001:db8::1]:50002").unwrap(),
+            (true, "2001:db8::1".to_owned(), 50002)
+        );
+        assert!(parse("http://host:50002").is_err());
+        assert!(parse("ssl://host:not-a-port").is_err());
+    }
+
+    /// A port typed into the host field leaves a name no resolver should
+    /// see. Once it hid an onion from the Tor check, and the certificate
+    /// check, which runs before the address is saved, handed that name to
+    /// the system resolver.
+    #[test]
+    fn a_host_with_a_port_still_in_it_is_refused() {
+        let onion = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion";
+        for url in [
+            format!("ssl://[{onion}:50001]:50002"),
+            format!("ssl://{onion}:50001:50002"),
+            format!("{onion}:50001:50002"),
+            format!("tcp://[{onion}:50001]"),
+        ] {
+            assert!(parse(&url).is_err(), "{url}");
+            assert!(inspect_blocking(&Target::new(url.clone(), None)).is_err());
+        }
+        // Spelled any way the standard allows, an onion is read as one.
+        let (_, host, _) = parse(&format!("ssl://{}%2E:50002", onion.to_uppercase())).unwrap();
+        assert_eq!(host, onion);
+        assert!(matches!(
+            inspect_blocking(&Target::new(format!("ssl://{onion}%2e:50002"), None)),
+            Ok(Inspection::Tor)
+        ));
+    }
+
+    /// Live. The whole trust-on-first-use path against real servers:
+    /// a certificate a public authority signs needs no acceptance, one a
+    /// server signed itself is described precisely and refused until it
+    /// is accepted, then it carries real data, and a different
+    /// certificate on the same host is refused again.
+    #[tokio::test]
+    #[ignore = "talks to public Electrum servers"]
+    async fn a_self_signed_server_asks_once_and_then_serves() {
+        let vouched = Target::new("ssl://electrum.blockstream.info:50002", None);
+        assert_eq!(
+            inspect_blocking(&vouched).unwrap(),
+            Inspection::Tls(Verdict::Trusted),
+            "blockstream's certificate is signed by a public authority"
+        );
+
+        // One of the servers Sparrow ships that signs its own.
+        let url = "ssl://electrum.emzy.de:50002";
+        let Inspection::Tls(Verdict::Unknown {
+            fingerprint,
+            reason,
+            subject,
+            expires,
+        }) = inspect_blocking(&Target::new(url, None)).unwrap()
+        else {
+            panic!("emzy's Electrum server is expected to sign its own certificate");
+        };
+        assert!(tls::is_fingerprint(&fingerprint), "{fingerprint}");
+        assert!(!reason.is_empty());
+        // The certificate says who it is and until when, even the one
+        // written in a version webpki refuses to read.
+        assert!(subject.is_some_and(|s| !s.is_empty()));
+        assert!(expires.is_some_and(|at| at > 1_700_000_000));
+
+        // Accepted once: the connection opens, and the server answers
+        // with real chain data over it.
+        let accepted = Target::new(url, Some(fingerprint.clone()));
+        assert_eq!(
+            inspect_blocking(&accepted).unwrap(),
+            Inspection::Tls(Verdict::Pinned)
+        );
+        let pizza: Txid = "a1075db55d416d3ca199f55b6084e2115b9345e16c5cf302fc80e9d5fbf5d48d"
+            .parse()
+            .unwrap();
+        let (facts, failed) = fetch_prevouts(&accepted, vec![OutPoint::new(pizza, 0)], None).await;
+        assert_eq!(
+            failed, None,
+            "an accepted certificate carries Electrum traffic"
+        );
+        let txout = facts[0]
+            .txout
+            .clone()
+            .expect("the server knows that transaction");
+        assert_eq!(txout.value.to_sat(), 1_000_000_000_000);
+
+        // Any other certificate on that host is refused, and named.
+        let elsewhere = Target::new(url, Some(["AA"; 32].join(":")));
+        match inspect_blocking(&elsewhere).unwrap() {
+            Inspection::Tls(Verdict::Changed { presented, stored }) => {
+                assert_eq!(presented, fingerprint);
+                assert_eq!(stored, ["AA"; 32].join(":"));
+            }
+            other => panic!("a changed certificate must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn errors_read_as_sentences_not_as_the_crate_spells_them() {
+        use electrum_client::Error;
+        let refused = Error::IOError(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(describe(&refused, TIMEOUT), "could not connect");
+        // Every call the crate's client makes is reported as a list of
+        // attempts; the sentence is the failure inside.
+        let attempts = Error::AllAttemptsErrored(vec![Error::IOError(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        ))]);
+        assert_eq!(describe(&attempts, TIMEOUT), "timed out after 20 s");
+        assert_eq!(describe(&attempts, TOR_TIMEOUT), "timed out after 60 s");
+        let unix_read_timeout =
+            Error::IOError(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert_eq!(
+            describe(&unix_read_timeout, TIMEOUT),
+            "timed out after 20 s"
+        );
+        let lookup = Error::IOError(std::io::Error::other(
+            "failed to lookup address information: Name or service not known",
+        ));
+        assert_eq!(describe(&lookup, TIMEOUT), "host not found");
+        let refusal = Error::Protocol(serde_json::json!({
+            "code": 1,
+            "message": "unknown method"
+        }));
+        assert_eq!(
+            describe(&refusal, TIMEOUT),
+            "the server refused the request: unknown method"
+        );
+        // Whatever the server wrote, one short line: no line break, no
+        // mark that turns the text around, nothing past 200 characters.
+        let written = Error::Protocol(serde_json::json!({
+            "code": 1,
+            "message": format!("history \u{202E}too long\nsee {}", "x".repeat(300)),
+        }));
+        let shown = describe(&written, TIMEOUT);
+        let words = shown
+            .detail()
+            .strip_prefix("the server refused the request: ")
+            .unwrap();
+        assert!(words.starts_with("history too longsee xx"), "{words}");
+        assert_eq!(words.chars().count(), 201);
+        assert!(words.ends_with('\u{2026}'));
+        let garbled = Error::JSON(serde_json::from_str::<u32>("x").unwrap_err());
+        assert_eq!(describe(&garbled, TIMEOUT), "unexpected response");
+        assert_eq!(
+            timeout_for(&Target::new(
+                "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001",
+                None
+            )),
+            TOR_TIMEOUT
+        );
+        assert_eq!(
+            timeout_for(&Target::new("ssl://electrum.example:50002", None)),
+            TIMEOUT
+        );
+    }
+
+    /// The inspection of an onion server is decided before any socket
+    /// exists, and in whatever case the address was stored: a `.ONION`
+    /// is a hidden service, not a plain TCP host to be looked up.
+    #[test]
+    fn an_onion_is_inspected_as_tor_in_any_case() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        let shouted = format!("tcp://{}.ONION:50001", ONION.to_ascii_uppercase());
+        assert_eq!(
+            inspect_blocking(&Target::new(format!("tcp://{ONION}.onion:50001"), None)).unwrap(),
+            Inspection::Tor
+        );
+        assert_eq!(
+            inspect_blocking(&Target::new(shouted.clone(), None)).unwrap(),
+            Inspection::Tor
+        );
+        // And without a route, the connection is refused before the
+        // name could reach a resolver, whatever the case.
+        let error = connect(&Target::new(shouted, None), None, &Arc::default())
+            .err()
+            .map(|e| e.to_string())
+            .expect("no route, no connection");
+        assert!(error.starts_with("tor: "), "{error}");
+    }
+
+    /// An onion in brackets is no address the URL parser reads, and the
+    /// Electrum reading of it names the onion all the same: it is taken
+    /// for one, inspected as one and never handed to a resolver.
+    #[test]
+    fn an_onion_in_brackets_is_still_an_onion() {
+        const ONION: &str = "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwxyz234567";
+        let bracketed = Target::new(format!("ssl://[{ONION}.onion]:50002"), None);
+        assert!(!crate::chain::is_onion(&bracketed.url));
+        assert_eq!(inspect_blocking(&bracketed).unwrap(), Inspection::Tor);
+        let error = connect(&bracketed, None, &Arc::default())
+            .err()
+            .map(|e| e.to_string())
+            .expect("no route, no connection");
+        assert!(error.starts_with("tor: "), "{error}");
+    }
+
+    #[test]
+    fn the_trust_key_is_the_socket_scheme_and_path_stripped() {
+        assert_eq!(
+            certificate_key("ssl://electrum.example:50002"),
+            "electrum.example:50002"
+        );
+        // Two spellings of the same server share one accepted certificate.
+        assert_eq!(
+            certificate_key("electrum.example:50002"),
+            certificate_key("ssl://electrum.example:50002")
+        );
+        // A default port is spelled out, so the key never depends on how
+        // the user typed the address.
+        assert_eq!(certificate_key("ssl://host"), "host:50002");
+    }
+
+    /// The settings store the address in canonical form. The key has
+    /// to read the host the same way, or a certificate accepted from
+    /// the address as typed is looked up under another key and asked
+    /// for a second time.
+    #[test]
+    fn the_trust_key_reads_the_host_the_way_the_store_does() {
+        let canonical = certificate_key("ssl://node.example.org:50002");
+        assert_eq!(canonical, "node.example.org:50002");
+        assert_eq!(certificate_key("SSL://Node.Example.ORG.:50002"), canonical);
+        assert_eq!(certificate_key("node.example.org.:50002"), canonical);
+        assert_eq!(certificate_key("ssl://NODE.EXAMPLE.ORG:50002"), canonical);
+        // An IPv6 literal in its canonical spelling, keyed as before.
+        assert_eq!(
+            certificate_key("ssl://[2001:DB8:0:0::1]:50002"),
+            "2001:db8::1:50002"
+        );
+        assert_eq!(certificate_key("[2001:db8::1]:50002"), "2001:db8::1:50002");
+    }
+
+    /// What an Electrum server answers a broadcast with is a refusal only
+    /// when it is the node's verdict, in the forms of ElectrumX, Fulcrum,
+    /// both electrs of Blockstream and mempool.space, and electrs; a
+    /// server short of memory, one that finds the request too costly, a
+    /// daemon it cannot reach, an answer that is not the protocol, a
+    /// connection that fails, is the way there failing.
+    #[test]
+    fn a_refusal_is_told_from_a_failure_of_the_way_there() {
+        use electrum_client::Error;
+        use serde_json::json;
+        for (code, message, words) in [
+            (
+                1,
+                "the transaction was rejected by network rules.\n\nmin relay fee not met, 0 < 11\n[0200]",
+                "min relay fee not met, 0 < 11",
+            ),
+            (
+                2,
+                "sendrawtransaction RPC error -26: min relay fee not met",
+                "min relay fee not met",
+            ),
+            (
+                -32603,
+                r#"sendrawtransaction RPC error: {"code":-25,"message":"bad-txns-inputs-missingorspent"}"#,
+                "bad-txns-inputs-missingorspent",
+            ),
+            (
+                2,
+                "Transaction outputs already in utxo set",
+                "Transaction outputs already in utxo set",
+            ),
+        ] {
+            let refused = Error::Protocol(json!({ "code": code, "message": message }));
+            assert_eq!(
+                sent_failure(&refused, TIMEOUT),
+                Failure::Refused(words.to_owned()),
+                "{message}"
+            );
+        }
+        for (code, message) in [
+            (2, "response budget exhausted, retry later"),
+            (-101, "excessive resource usage"),
+            (
+                2,
+                "daemon error: DaemonError({'code': -28, 'message': 'Loading block index...'})",
+            ),
+            (2, "Daemon is unavailable: connection refused"),
+            (1, "failed to broadcast transaction: connection refused"),
+        ] {
+            let error = Error::Protocol(json!({ "code": code, "message": message }));
+            assert!(
+                matches!(sent_failure(&error, TIMEOUT), Failure::Transport(_)),
+                "{message}"
+            );
+        }
+        let cut = Error::AllAttemptsErrored(vec![Error::IOError(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ))]);
+        assert!(matches!(sent_failure(&cut, TIMEOUT), Failure::Transport(_)));
+        let garbled = Error::InvalidResponse(json!("not a txid"));
+        assert!(matches!(
+            sent_failure(&garbled, TIMEOUT),
+            Failure::Transport(_)
+        ));
+    }
+
+    /// A coin is unknown only when the server says it has no such
+    /// transaction, in the words of the servers there are; a server that
+    /// refuses for another reason has said nothing of the coin.
+    #[test]
+    fn only_no_such_transaction_makes_a_coin_unknown() {
+        use electrum_client::Error;
+        use serde_json::json;
+        for message in [
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.",
+            "daemon error: DaemonError({'code': -5, 'message': 'No such mempool or blockchain transaction. Use gettransaction for wallet transactions.'})",
+            "missing transaction",
+            "tx not found",
+        ] {
+            let error = Error::Protocol(json!({ "code": 1, "message": message }));
+            assert!(no_such_transaction(&error), "{message}");
+        }
+        for message in [
+            "response budget exhausted, retry later",
+            "excessive resource usage",
+        ] {
+            let error = Error::Protocol(json!({ "code": 2, "message": message }));
+            assert!(!no_such_transaction(&error), "{message}");
+        }
+    }
+
+    /// The standing of a sent transaction: a history the server turns
+    /// down for want of memory is asked again, not passed over.
+    #[tokio::test]
+    async fn a_standing_asks_again_a_server_short_of_memory() {
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(&[nowhere(1, 0)], &[(&script(1), 1_000)]);
+        server.set_history(&script(1), &[(tx.compute_txid(), 90)]);
+        server
+            .state
+            .lock()
+            .unwrap()
+            .busy
+            .insert("blockchain.scripthash.get_history", 1);
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = tx_standing(
+            &target,
+            crate::network::Network::Signet,
+            tx.compute_txid(),
+            crate::chain::lookup_scripts(&tx),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(standing, (true, Some(90), 100));
+    }
+
+    /// The standing of a sent transaction takes no confirmation on the
+    /// server's word: one claimed far above the tip it gave is a false
+    /// proof, one a block or two above it waits for the next look.
+    #[tokio::test]
+    async fn a_standing_takes_no_confirmation_on_the_servers_word() {
+        use crate::chain::proof::FALSE_PROOF;
+        use crate::testkit::{FakeElectrum, nowhere, script, transaction};
+        let server = FakeElectrum::start().await;
+        let tx = transaction(&[nowhere(1, 0)], &[(&script(1), 1_000)]);
+        let target = Target::new(format!("tcp://{}", server.address), None);
+        let standing = |height: i64| {
+            server.set_history(&script(1), &[(tx.compute_txid(), height)]);
+            tx_standing(
+                &target,
+                crate::network::Network::Signet,
+                tx.compute_txid(),
+                crate::chain::lookup_scripts(&tx),
+                None,
+            )
+        };
+        assert_eq!(standing(102).await.unwrap(), (true, None, 100));
+        assert_eq!(standing(200).await.unwrap_err(), FALSE_PROOF);
+        assert_eq!(standing(90).await.unwrap(), (true, Some(90), 100));
+    }
+}

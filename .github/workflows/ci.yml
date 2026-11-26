@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A pull request pushed again stops its previous run, which nobody will
+# merge. Every other run has a group of its own: GitHub would otherwise
+# drop a pending run on main when a newer one arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Whether the jobs that compile have anything to check. On a pull
+  # request whose files are all documentation, listed below, they are
+  # skipped, and a skipped job counts as passed. Any other path, a push to
+  # main and a manual run, run them all. Only an explicit `false` skips
+  # them: if this job fails or is cancelled, they still run.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.paths.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # The merge commit of the pull request and its first parent, the
+          # base branch: the diff between them is what the merge changes.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Read the changed paths
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          code=true
+          if [ "$EVENT" = pull_request ]; then
+            paths=$(git -c core.quotePath=false diff --name-only --no-renames HEAD^1 HEAD)
+            [ -z "$paths" ] || code=false
+            while IFS= read -r path; do
+              case "$path" in
+                README.md | CONTRIBUTING.md | SECURITY.md | TRADEMARK.md) ;;
+                LICENSE | .github/PULL_REQUEST_TEMPLATE.md) ;;
+                .github/ISSUE_TEMPLATE/*.yml | .github/ISSUE_TEMPLATE/*.md) ;;
+                .github/images/*.svg | .github/images/*.webp) ;;
+                .github/images/*.png | CHANGELOG.md) ;;
+                *) code=true ;;
+              esac
+            done <<<"$paths"
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        run: cargo test
+
+  # Both apps ship with the Tor client compiled in, and nothing above
+  # builds that code. Checking it here keeps the shipped configuration
+  # honest without paying for a full arti test run on every push.
+  embedded-tor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: embedded-tor
+      - name: Lint with the Tor client built in
+        run: cargo clippy --all-targets --features embedded-tor -- -D warnings
+
+  # The code behind #[cfg(windows)], which no Linux job compiles: the
+  # desktop ships it. ring and secp256k1-sys compile C for
+  # the target, so a check from Linux would need a MinGW toolchain;
+  # this runs on Windows itself, for the MSVC target the desktop builds.
+  # On the pull request and on demand: the push to main that merges it
+  # would only check the same code again.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: changes
+    if: ${{ !cancelled() && github.event_name != 'push' && needs.changes.outputs.code != 'false' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows
+      - name: Lint for Windows
+        run: cargo clippy --all-targets -- -D warnings
+      # The one test of that code that asks Windows itself: who listens
+      # on a loopback port, read from the TCP table and a process token.
+      - name: Test the loopback owner check
+        run: cargo test --lib chain::tor::owner::tests::a_listener_opened_here_belongs_to_this_account -- --exact

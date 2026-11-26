@@ -1,0 +1,126 @@
+[package]
+name = "gerfaut-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Core library of Gerfaut, a Bitcoin watch-only wallet"
+repository = "https://github.com/gerfaut-dev/gerfaut-core"
+license = "AGPL-3.0-only"
+publish = false
+
+[features]
+# No Tor client is built in by default: a consumer asks for one. Both
+# apps do: a phone rarely runs a Tor daemon and Orbot is a second app
+# to install, and a desktop user should not have to install Tor to
+# read a .onion backend either.
+default = []
+# A Tor client built into the library, so .onion backends work on a
+# device with no Tor daemon. Off, .onion hosts still work through a
+# system Tor.
+embedded-tor = ["dep:arti-client", "dep:tor-rtcompat", "dep:tor-config"]
+
+[dependencies]
+bdk_wallet = "3.2"
+# The blocking Electrum client a descriptor sync speaks through, over a
+# stream the core opens itself (`chain::tls`, `RawClient::from`). No TLS
+# feature: its own TLS would trust the authorities of `webpki-roots`
+# 0.25, which still holds roots since distrusted (RUSTSEC-2026-0381),
+# and no path of the core opens a connection through it.
+electrum-client = { version = "0.25", default-features = false, features = ["proxy"] }
+# `rustls-no-provider`: every client gets the core's own TLS, ring and
+# the authorities of `webpki-roots` (`chain::http_client`); `rustls`
+# would add aws-lc-rs as reqwest's default provider, for nothing.
+# `gzip`: Esplora answers are JSON, and compressed they are about a
+# quarter of the size. The client asks for it and decompresses on its
+# own; what reads a body whole still caps it where it did. `socks`: an
+# onion host is reached through the Tor proxy.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "socks"] }
+# Reads a server address the way the HTTP client will, so the Tor check
+# and the connection never mean two different hosts; the version
+# reqwest already pulls in, so nothing new is compiled.
+url = "2.5.8"
+# Direct, so Electrum connections can carry their own certificate
+# verifier; the version and provider reqwest and tokio-rustls pull in.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+# The live watcher holds one connection open and waits on it, which the
+# blocking Electrum client cannot do, so it opens its own sockets: TLS
+# over tokio with the same verifier and the same ring provider. The
+# version reqwest already pulls in, so nothing new is compiled.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# WebSocket client, for the push API of mempool instances. Handshake
+# and framing only: the socket, the proxy and TLS stay ours, so the
+# connection takes the same route a sync does. MIT or Apache-2.0,
+# maintained, and most of what it needs is already in the tree.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The sink and stream halves of that WebSocket; arti's bootstrap events
+# use it too.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Reads a certificate the way it was written: its fingerprint's
+# subject and expiry for the acceptance dialog, and its public key
+# when the certificate predates X.509 v3 and webpki declines it.
+x509-parser = { version = "0.18", default-features = false }
+serde = { version = "1", features = ["derive"] }
+# `raw_value` keeps the result of an Electrum answer as its text until
+# the call that asked for it says what it should be.
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+# Says what the core gave up on, for whatever logger the app installs;
+# the version the tree already pulls in, so nothing new is compiled.
+log = "0.4"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net", "io-util"] }
+chacha20poly1305 = "0.11"
+# With `zeroize`, Argon2 wipes its own working hashes too, the one
+# that stands for the password among them.
+argon2 = { version = "0.6", features = ["zeroize"] }
+rand = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+# The exclusive lock on the vault: flock on Unix and Android, LockFileEx
+# on Windows. The standard library's own `File::try_lock` answers
+# "unsupported" on Android. Built on rustix and windows-sys, both
+# already in the tree.
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+# Constant-time comparison of the app lock hash.
+subtle = "2"
+uuid = { version = "1", features = ["v4"] }
+ur = "0.5"
+# Reads the fountain part of a UR frame (`ur::fountain::Part`) before
+# the decoder takes it. The version `ur` already pulls in, so nothing
+# new is compiled.
+minicbor = "2"
+ciborium = "0.2"
+flate2 = "1"
+data-encoding = "2"
+# Embedded Tor. The rustls runtime keeps the tree free of OpenSSL, the
+# bundled sqlite keeps it free of system libraries, and the onion
+# service client is what a .onion backend needs.
+arti-client = { version = "0.48", default-features = false, features = ["tokio", "rustls", "compression", "onion-service-client", "vanguards", "static-sqlite"], optional = true }
+tor-rtcompat = { version = "0.48", default-features = false, features = ["tokio", "rustls"], optional = true }
+# Names the channel padding level, which arti-client takes and does not
+# re-export. The version arti already pulls in, so nothing new is
+# compiled.
+tor-config = { version = "0.48", default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# The flags an old vault is opened with to close it to others: never
+# through a link, never stuck on a pipe. The version the tree already
+# pulls in, so nothing new is compiled.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Who listens on a loopback port, for the Tor proxy check: the TCP
+# listener table and the user of a process's token. The version tokio
+# and mio already pull in, so no new crate is fetched.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Security", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile = "3"
+# `test-util`: a test can hold the clock of its runtime still, so that a
+# deadline under test runs out when the test says, not when a machine
+# busy with the rest of the suite gets round to it.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+# A lint silenced without a reason hides why, and the next reader keeps
+# it out of habit: every #[allow] says why in its `reason`.
+[lints.clippy]
+allow_attributes_without_reason = "warn"

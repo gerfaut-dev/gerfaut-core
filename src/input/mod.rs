@@ -1,0 +1,3159 @@
+//! Automatic recognition of imported wallet material.
+//!
+//! Whatever the user pastes, scans, or opens as a file ends up here as
+//! text. This module decides what it is (descriptor, extended public key,
+//! address, wallet export file), normalizes it into canonical output
+//! descriptors, and reports what it understood so the app can ask for
+//! confirmation. Detection is never silent.
+//!
+//! Anything that carries private key material — extended private keys,
+//! WIF keys, seed phrases — is rejected before it is read as wallet
+//! material, the strings of a JSON export once more after decoding,
+//! and is never stored or logged.
+
+pub mod bsms;
+pub mod qr;
+pub mod xpub;
+
+use bdk_wallet::bitcoin::NetworkKind;
+use bdk_wallet::bitcoin::address::Address;
+use bdk_wallet::bitcoin::base58;
+use bdk_wallet::miniscript::ForEachKey;
+use bdk_wallet::miniscript::descriptor::{
+    Descriptor, DescriptorPublicKey, DescriptorType, Wildcard,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::backup::BACKUP_PREFIX;
+use crate::error::{CoreError, CoreResult};
+use crate::network::Network;
+
+/// Upper bound on accepted input size. Descriptors are at most a few
+/// kilobytes; anything larger is not wallet material.
+const MAX_INPUT_LEN: usize = 64 * 1024;
+
+/// Script type of a wallet, kept explicit next to the descriptors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptKind {
+    /// P2PKH (`pkh`)
+    Legacy,
+    /// P2SH-P2WPKH (`sh(wpkh)`)
+    NestedSegwit,
+    /// P2WPKH (`wpkh`)
+    Segwit,
+    /// P2TR (`tr`)
+    Taproot,
+    /// P2WSH or P2SH-P2WSH script (`wsh`, `sh(wsh)`), multisig included
+    WitnessScript,
+    /// Bare P2SH script (`sh`)
+    LegacyScript,
+    /// Bare output (`pk`, raw miniscript)
+    Bare,
+}
+
+/// What the classifier recognized, for the confirmation screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecognizedKind {
+    /// A single output descriptor.
+    Descriptor,
+    /// Two descriptors, receive and change.
+    DescriptorPair,
+    /// A BIP-389 multipath descriptor (`<0;1>`), split into a pair.
+    MultipathDescriptor,
+    /// An extended public key, standard or SLIP-132.
+    ExtendedKey,
+    /// A single Bitcoin address.
+    Address,
+    /// A wallet export file (JSON).
+    WalletExport,
+    /// A BSMS descriptor record (BIP-129).
+    Bsms,
+}
+
+/// Non-fatal findings the app must surface on the confirmation screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputWarning {
+    /// A bare `xpub`/`tpub` carries no script type; BIP84 (`wpkh`) was
+    /// assumed. The alternatives are listed in `script_options`.
+    AssumedSegwit,
+    /// The key used a SLIP-132 prefix and was normalized to `xpub`/`tpub`.
+    Slip132Converted,
+    /// A single descriptor with a wildcard but no internal path: change
+    /// outputs will not be tracked.
+    ChangeNotTracked,
+    /// The export file contains several account types; the preferred one
+    /// was selected.
+    MultipleAccountsInFile,
+    /// The branches differ from the BIP32 convention (`0/*` receive,
+    /// `1/*` change): a wallet that follows it shows other addresses.
+    NonStandardDerivation,
+    /// A key in a QR code (`crypto-output`) named no child path: the
+    /// receive and change branches (`/<0;1>/*`) were assumed. The first
+    /// address is the one to compare with the signer.
+    AssumedBranches,
+}
+
+/// Normalized wallet material produced by the classifier.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ParsedPayload {
+    /// Canonical descriptors, checksummed.
+    Descriptors {
+        external: String,
+        internal: Option<String>,
+        script: ScriptKind,
+    },
+    /// A single address to watch.
+    Address { address: String },
+}
+
+/// Full classification result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParsedInput {
+    pub kind: RecognizedKind,
+    /// Candidate networks, in display order. More than one entry means
+    /// the input alone cannot tell (test networks share encodings) and
+    /// the active workspace network decides.
+    pub networks: Vec<Network>,
+    pub payload: ParsedPayload,
+    pub warnings: Vec<InputWarning>,
+    /// Script types the user may pick instead of the one in `payload`.
+    /// Non-empty only when the input does not fix the script type by
+    /// itself: a lone extended key with a plain prefix, whose origin, if
+    /// any, only suggests one. Re-run [`parse_input_with_options`] with
+    /// the choice to rebuild the descriptors.
+    #[serde(default)]
+    pub script_options: Vec<ScriptKind>,
+    /// Branches and origin behind `payload` for a lone extended key,
+    /// defaults filled in. `None` when the input spells out its own.
+    #[serde(default)]
+    pub derivation: Option<DerivationChoice>,
+    /// True when `derivation` may still be changed; only a lone extended
+    /// key leaves it open. Re-run [`parse_input_with_options`] with the
+    /// new choice to rebuild the descriptors.
+    #[serde(default)]
+    pub derivation_editable: bool,
+    /// First receive address, so the user can compare it with the
+    /// wallet they are importing. Derived for the network chosen in
+    /// [`ImportOptions::network`] when it is one of `networks`, for the
+    /// first candidate otherwise: a test key reads `tb1…` on signet and
+    /// testnet, `bcrt1…` on regtest. `None` for single addresses and
+    /// for descriptors that cannot derive one.
+    #[serde(default)]
+    pub preview_address: Option<String>,
+}
+
+/// Script types a lone extended key can be imported as.
+pub const SINGLE_KEY_SCRIPTS: [ScriptKind; 4] = [
+    ScriptKind::Legacy,
+    ScriptKind::NestedSegwit,
+    ScriptKind::Segwit,
+    ScriptKind::Taproot,
+];
+
+/// Receive branch every single-key wallet uses, BIP44 through BIP86.
+const RECEIVE_BRANCH: &str = "0/*";
+/// Change branch of the same convention.
+const CHANGE_BRANCH: &str = "1/*";
+
+/// Where a lone extended key derives its addresses from.
+///
+/// Wallets agree on `0/*` for receive and `1/*` for change, so the
+/// defaults cover almost every import. The fields exist for the rest: a
+/// key exported one level up, an odd branch, an origin the signer will
+/// need in the descriptor later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DerivationChoice {
+    /// Receive branch, relative to the key, unhardened, wildcard last
+    /// (`0/*`, `*`, `2/0/*`).
+    pub receive: String,
+    /// Change branch in the same form; `None` leaves change untracked.
+    pub change: Option<String>,
+    /// Key origin, `[fingerprint/path]`; `None` keeps the one the input
+    /// carries, if any.
+    pub origin: Option<String>,
+}
+
+impl Default for DerivationChoice {
+    fn default() -> Self {
+        Self {
+            receive: RECEIVE_BRANCH.to_owned(),
+            change: Some(CHANGE_BRANCH.to_owned()),
+            origin: None,
+        }
+    }
+}
+
+/// What the user picked on the confirmation screen. The script and the
+/// derivation only apply to inputs that leave them open, which is a
+/// lone extended key; the others fix their own and ignore them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImportOptions {
+    pub script: Option<ScriptKind>,
+    pub derivation: Option<DerivationChoice>,
+    /// The network the wallet is about to be added on, which the
+    /// preview address is derived for. Ignored when the input does not
+    /// allow it; `None` means the first candidate.
+    #[serde(default)]
+    pub network: Option<Network>,
+}
+
+/// Classifies raw user input into wallet material.
+///
+/// The classification order is: BSMS record, private material
+/// rejection, Gerfaut backup (refused: it is restored, not watched), QR
+/// envelope (opened once, its text classified in turn), JSON export,
+/// transaction (refused: it is broadcast, not watched), descriptor(s),
+/// extended public key, address or payment URI. Errors from a
+/// recognized but invalid format are reported as such; only inputs
+/// matching nothing at all yield [`CoreError::UnrecognizedInput`].
+pub fn parse_input(input: &str) -> CoreResult<ParsedInput> {
+    parse_input_with_options(input, &ImportOptions::default())
+}
+
+/// Same as [`parse_input`], with the script type the user picked for a
+/// lone extended key.
+pub fn parse_input_with(input: &str, script: Option<ScriptKind>) -> CoreResult<ParsedInput> {
+    parse_input_with_options(
+        input,
+        &ImportOptions {
+            script,
+            ..ImportOptions::default()
+        },
+    )
+}
+
+/// Same as [`parse_input`], with everything the user may pick: the
+/// script type and paths of a lone extended key, and the network the
+/// preview address is derived for. Inputs that fix their own script
+/// type and paths (`script_options` empty, `derivation_editable` false)
+/// ignore those two.
+pub fn parse_input_with_options(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
+    if bsms::is_bsms(input) {
+        let parsed = parse_bsms_record(input)?;
+        engine_takes(&parsed)?;
+        return Ok(parsed);
+    }
+    let mut parsed = classify(input, options)?;
+    engine_takes(&parsed)?;
+    if parsed.preview_address.is_none() {
+        parsed.preview_address = preview_address(&parsed, options.network);
+    }
+    Ok(parsed)
+}
+
+/// Builds the engine a wallet of this input would be watched with, the
+/// way adding it builds it ([`crate::manager::engine_for`]), on the first
+/// network the input allows, and drops it: what only the engine refuses
+/// is refused at reading, where the person sees it, and never after they
+/// asked to add the wallet. The network does not change the verdict:
+/// the engine reads the kind of network of the keys, the same for every
+/// network the input allows.
+fn engine_takes(parsed: &ParsedInput) -> CoreResult<()> {
+    let ParsedPayload::Descriptors {
+        external,
+        internal,
+        script,
+    } = &parsed.payload
+    else {
+        return Ok(());
+    };
+    let Some(network) = parsed.networks.first() else {
+        return Ok(());
+    };
+    let kind = crate::wallet::meta::WalletKind::Descriptors {
+        external: external.clone(),
+        internal: internal.clone(),
+        script: *script,
+    };
+    crate::manager::engine_for(&kind, *network)
+        .map(|_| ())
+        .map_err(|error| match error {
+            CoreError::Descriptor(detail) => CoreError::InvalidInput {
+                kind: "descriptor",
+                detail,
+            },
+            other => other,
+        })
+}
+
+/// A BSMS record is its descriptor plus a promise: the first address the
+/// coordinator derived. Gerfaut derives it too and refuses the record
+/// when the two differ, the same check every signer makes.
+///
+/// Test networks share their keys, not their addresses: the address in
+/// the record also says which of the networks the keys allow it is for,
+/// regtest included.
+fn parse_bsms_record(input: &str) -> CoreResult<ParsedInput> {
+    if input.trim().len() > MAX_INPUT_LEN {
+        return Err(CoreError::UnrecognizedInput("input too large".to_owned()));
+    }
+    reject_private_material(input.trim())?;
+    let record = bsms::parse_bsms(input)?;
+    let mut parsed = classify(&record.descriptor, &ImportOptions::default())?;
+    let derived: Vec<(Network, String)> = parsed
+        .networks
+        .iter()
+        .filter_map(|network| Some((*network, first_address(&parsed.payload, *network)?)))
+        .collect();
+    let matching: Vec<&(Network, String)> = derived
+        .iter()
+        .filter(|(_, address)| address.eq_ignore_ascii_case(&record.first_address))
+        .collect();
+    match (matching.first(), derived.first()) {
+        (Some((_, address)), _) => {
+            parsed.preview_address = Some(address.clone());
+            parsed.networks = matching.iter().map(|(network, _)| *network).collect();
+        }
+        (None, Some((_, derived))) => {
+            return Err(CoreError::InvalidInput {
+                kind: "bsms",
+                detail: format!(
+                    "the first address in the record ({}) is not the one this descriptor derives ({derived}); the file may be altered or belong to another network",
+                    record.first_address
+                ),
+            });
+        }
+        (None, None) => {
+            return Err(CoreError::InvalidInput {
+                kind: "bsms",
+                detail: "the descriptor in the record derives no address".to_owned(),
+            });
+        }
+    }
+    parsed.kind = RecognizedKind::Bsms;
+    Ok(parsed)
+}
+
+fn classify(input: &str, options: &ImportOptions) -> CoreResult<ParsedInput> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::UnrecognizedInput("empty input".to_owned()));
+    }
+    if trimmed.len() > MAX_INPUT_LEN {
+        return Err(CoreError::UnrecognizedInput("input too large".to_owned()));
+    }
+
+    reject_private_material(trimmed)?;
+
+    // A backup is restored from the settings, not watched as a wallet.
+    if trimmed.starts_with(BACKUP_PREFIX) {
+        return Err(CoreError::InvalidInput {
+            kind: "backup",
+            detail: "this is a Gerfaut backup, not a wallet to watch: restore it from Settings"
+                .to_owned(),
+        });
+    }
+
+    // A pasted QR payload (UR, BBQr) is opened first; a multi-part one
+    // cannot be typed in, it has to be scanned frame by frame.
+    if qr::is_envelope(trimmed) {
+        let qr::QrProgress {
+            text,
+            total,
+            warnings,
+            ..
+        } = qr::open_pasted(trimmed)?;
+        let Some(text) = text else {
+            return Err(qr::pasted_part(trimmed, total));
+        };
+        // A BSMS record in an envelope is checked as one pasted bare.
+        let mut parsed = match qr::opened_once(text)? {
+            text if bsms::is_bsms(&text) => parse_bsms_record(&text),
+            text => classify(&text, options),
+        }?;
+        for warning in warnings {
+            if !parsed.warnings.contains(&warning) {
+                parsed.warnings.push(warning);
+            }
+        }
+        return Ok(parsed);
+    }
+
+    if trimmed.starts_with('{') {
+        return parse_json_export(trimmed);
+    }
+
+    // A signed transaction or a PSBT is a thing to broadcast, not a
+    // thing to watch: say so instead of "unrecognized".
+    if crate::broadcast::looks_like_transaction(trimmed) {
+        return Err(CoreError::InvalidInput {
+            kind: "transaction",
+            detail: "this is a transaction, not a wallet to watch: the Broadcast page sends it"
+                .to_owned(),
+        });
+    }
+
+    // A line that opens with `#` is a comment, as in the descriptor file
+    // Sparrow exports: a checksum never starts a line.
+    let lines: Vec<&str> = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+
+    if lines.len() == 2 && lines[0].contains('(') && lines[1].contains('(') {
+        return parse_descriptor_pair(lines[0], lines[1]);
+    }
+    if lines.len() == 3 && lines.iter().all(|l| l.contains('(')) {
+        return parse_descriptor_file(&lines);
+    }
+    if lines.len() != 1 {
+        return Err(CoreError::UnrecognizedInput(
+            "expected a single value, or two descriptors on two lines".to_owned(),
+        ));
+    }
+    let token = lines[0];
+
+    if token.contains('(') {
+        return parse_single_descriptor(token);
+    }
+    if let Some((origin, key)) = split_key_origin(token) {
+        return parse_extended_key(key, Some(origin), options);
+    }
+    if xpub::looks_like_extended_key(token) {
+        return parse_extended_key(token, None, options);
+    }
+    if let Ok(address) = payment_address(token).parse::<Address<_>>() {
+        return classify_address(address);
+    }
+
+    Err(CoreError::UnrecognizedInput(
+        "not a descriptor, extended public key, address, or wallet export".to_owned(),
+    ))
+}
+
+// --- private material rejection ---------------------------------------
+
+/// Rejects any input carrying private key material: extended private
+/// keys (all SLIP-132 prefixes), WIF keys, and likely seed phrases.
+///
+/// This runs before any parsing so that a private input fails with a
+/// clear, dedicated error instead of a confusing format error — and so
+/// that no other code path ever sees the material.
+pub(crate) fn reject_private_material(input: &str) -> CoreResult<()> {
+    for token in input.split(|c: char| !xpub::is_base58_char(c)) {
+        if token.len() < 20 {
+            continue;
+        }
+        if xpub::has_private_prefix(token) {
+            return Err(CoreError::PrivateMaterialRejected);
+        }
+        // WIF: 51-52 base58check chars, version byte 0x80 (mainnet) or
+        // 0xEF (testnet), 32-byte key with optional compression flag.
+        if matches!(token.len(), 51 | 52)
+            && let Ok(decoded) = base58::decode_check(token)
+            && matches!(decoded.len(), 33 | 34)
+            && matches!(decoded[0], 0x80 | 0xEF)
+        {
+            return Err(CoreError::PrivateMaterialRejected);
+        }
+    }
+
+    // Seed phrase heuristic: BIP39 word counts, all plausible words.
+    let words: Vec<&str> = input.split_whitespace().collect();
+    if matches!(words.len(), 12 | 15 | 18 | 21 | 24)
+        && words
+            .iter()
+            .all(|w| w.len() >= 3 && w.len() <= 8 && w.chars().all(|c| c.is_ascii_lowercase()))
+    {
+        return Err(CoreError::PrivateMaterialRejected);
+    }
+
+    Ok(())
+}
+
+// --- descriptors -------------------------------------------------------
+
+/// Deepest nesting a descriptor may have, in parentheses and braces.
+/// A real wallet stays within a dozen levels. Miniscript reads and
+/// walks a descriptor recursively, so text nested thousands deep would
+/// overflow the stack of whatever thread reads it.
+const MAX_DESCRIPTOR_DEPTH: usize = 100;
+
+/// Reads a descriptor of public keys. Every descriptor comes in through
+/// here, whether pasted, opened from a file, scanned, read from a BSMS
+/// record or a backup, or handed back by the app to be added, and two
+/// things miniscript only fails on at the wrong moment are refused
+/// first: nesting deep enough to overflow the stack, before the parser
+/// sees the text, and a key that cannot derive its own addresses.
+pub(crate) fn read_descriptor(text: &str) -> CoreResult<Descriptor<DescriptorPublicKey>> {
+    let invalid = |detail: String| CoreError::InvalidInput {
+        kind: "descriptor",
+        detail,
+    };
+    if nesting_depth(text) > MAX_DESCRIPTOR_DEPTH {
+        return Err(invalid(format!(
+            "the descriptor nests deeper than {MAX_DESCRIPTOR_DEPTH} levels"
+        )));
+    }
+    let descriptor = text
+        .parse::<Descriptor<DescriptorPublicKey>>()
+        .map_err(|e| invalid(e.to_string()))?;
+    if let Some(step) = hardened_derivation(&descriptor) {
+        return Err(invalid(format!(
+            "an extended public key cannot derive {step}: write the hardened steps in the key \
+             origin, as in `[fingerprint/84'/0'/0']xpub…/0/*`"
+        )));
+    }
+    if let Some((depth, steps)) = too_deep(&descriptor) {
+        let written = match steps {
+            1 => "the step written after it goes".to_owned(),
+            steps => format!("the {steps} steps written after it go"),
+        };
+        return Err(invalid(format!(
+            "an extended public key at depth {depth} cannot derive its addresses: {written} \
+             past depth {MAX_KEY_DEPTH}, the deepest a BIP32 key can be"
+        )));
+    }
+    Ok(descriptor)
+}
+
+/// The deepest an extended key can be, BIP32 writing its depth on one
+/// byte.
+const MAX_KEY_DEPTH: u32 = u8::MAX as u32;
+
+/// The depth of an extended key in the descriptor that would derive
+/// past [`MAX_KEY_DEPTH`], and the steps that take it there: those
+/// written after it, plus one for a wildcard. Such a key has no address
+/// to give, and miniscript panics when asked for one; refused here, it
+/// never reaches a derivation, whether it was typed, scanned or read
+/// from a backup.
+fn too_deep(descriptor: &Descriptor<DescriptorPublicKey>) -> Option<(u32, u32)> {
+    let mut found = None;
+    descriptor.for_any_key(|key| {
+        let (depth, longest, wildcard) = match key {
+            DescriptorPublicKey::Single(_) => return false,
+            DescriptorPublicKey::XPub(xkey) => {
+                (xkey.xkey.depth, xkey.derivation_path.len(), xkey.wildcard)
+            }
+            DescriptorPublicKey::MultiXPub(xkey) => (
+                xkey.xkey.depth,
+                xkey.derivation_paths
+                    .paths()
+                    .iter()
+                    .map(|path| path.len())
+                    .max()
+                    .unwrap_or(0),
+                xkey.wildcard,
+            ),
+        };
+        let steps = u32::try_from(longest)
+            .unwrap_or(u32::MAX)
+            .saturating_add(u32::from(wildcard != Wildcard::None));
+        if u32::from(depth).saturating_add(steps) > MAX_KEY_DEPTH {
+            found = Some((u32::from(depth), steps));
+        }
+        found.is_some()
+    });
+    found
+}
+
+/// The deepest the parentheses and braces of `text` nest, counted on
+/// the text alone.
+fn nesting_depth(text: &str) -> usize {
+    let mut depth = 0usize;
+    let mut deepest = 0usize;
+    for byte in text.bytes() {
+        match byte {
+            b'(' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b')' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// What an extended key in the descriptor is asked to derive and
+/// cannot: a hardened step written after the key, or a hardened
+/// wildcard. Only the private key derives those, and miniscript panics
+/// when asked for such an address. The steps belong in the key origin,
+/// which records what the signer derived.
+fn hardened_derivation(descriptor: &Descriptor<DescriptorPublicKey>) -> Option<String> {
+    let mut found = None;
+    descriptor.for_any_key(|key| {
+        let (paths, wildcard) = match key {
+            DescriptorPublicKey::Single(_) => return false,
+            DescriptorPublicKey::XPub(xkey) => {
+                (std::slice::from_ref(&xkey.derivation_path), xkey.wildcard)
+            }
+            DescriptorPublicKey::MultiXPub(xkey) => {
+                (xkey.derivation_paths.paths().as_slice(), xkey.wildcard)
+            }
+        };
+        let step = paths
+            .iter()
+            .flat_map(|path| path.into_iter())
+            .find(|step| step.is_hardened());
+        found = match (step, wildcard) {
+            (Some(step), _) => Some(format!("the hardened step `{step}` written after it")),
+            (None, Wildcard::Hardened) => Some("hardened addresses (`*h`)".to_owned()),
+            (None, _) => None,
+        };
+        found.is_some()
+    });
+    found
+}
+
+fn script_kind_of(descriptor: &Descriptor<DescriptorPublicKey>) -> ScriptKind {
+    match descriptor.desc_type() {
+        DescriptorType::Pkh => ScriptKind::Legacy,
+        DescriptorType::Wpkh => ScriptKind::Segwit,
+        DescriptorType::ShWpkh => ScriptKind::NestedSegwit,
+        DescriptorType::Tr => ScriptKind::Taproot,
+        DescriptorType::Wsh
+        | DescriptorType::WshSortedMulti
+        | DescriptorType::ShWsh
+        | DescriptorType::ShWshSortedMulti => ScriptKind::WitnessScript,
+        DescriptorType::Sh | DescriptorType::ShSortedMulti => ScriptKind::LegacyScript,
+        _ => ScriptKind::Bare,
+    }
+}
+
+/// Candidate networks of a descriptor, from the version bytes of the
+/// extended keys it contains. A descriptor without extended keys is
+/// network-agnostic; one mixing mainnet and test keys is rejected.
+pub(crate) fn descriptor_networks(
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<Vec<Network>> {
+    let mut kinds: Vec<NetworkKind> = Vec::new();
+    descriptor.for_each_key(|key| {
+        let key_kind = match key {
+            DescriptorPublicKey::XPub(xkey) => Some(xkey.xkey.network),
+            DescriptorPublicKey::MultiXPub(xkey) => Some(xkey.xkey.network),
+            DescriptorPublicKey::Single(_) => None,
+        };
+        if let Some(key_kind) = key_kind
+            && !kinds.contains(&key_kind)
+        {
+            kinds.push(key_kind);
+        }
+        true
+    });
+    if kinds.len() > 1 {
+        return Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: "the descriptor mixes mainnet and test network keys".to_owned(),
+        });
+    }
+    Ok(networks_for_kind(kinds.first().copied()))
+}
+
+fn networks_for_kind(kind: Option<NetworkKind>) -> Vec<Network> {
+    match kind {
+        Some(NetworkKind::Main) => vec![Network::Mainnet],
+        Some(NetworkKind::Test) => vec![Network::Signet, Network::Testnet4, Network::Regtest],
+        None => Network::ALL.to_vec(),
+    }
+}
+
+/// A SLIP-132 key is read the same inside a descriptor as on its own:
+/// rewritten to the standard prefix, and said so once.
+fn slip132_warning(converted: bool) -> Vec<InputWarning> {
+    if converted {
+        vec![InputWarning::Slip132Converted]
+    } else {
+        vec![]
+    }
+}
+
+/// The prefix of a SLIP-132 key names the script the wallet exported
+/// it for: `zpub` a P2WPKH key, `ypub` one under P2SH, `Zpub` a P2WSH
+/// cosigner and `Ypub` one under P2SH, `vpub` and the rest the same on
+/// a test network. A descriptor that wraps the key in anything else
+/// was not written by the wallet that exported the key, or not for
+/// it, and the addresses it derives are not the ones that wallet
+/// shows. Refused naming both, the prefix and the function, rather
+/// than imported as the descriptor says with a notice beside it.
+fn check_slip132_hints(
+    hints: &[xpub::Slip132Hint],
+    descriptor: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    use DescriptorType::{ShWpkh, ShWsh, ShWshSortedMulti, Wpkh, Wsh, WshSortedMulti};
+    let kind = descriptor.desc_type();
+    for hint in hints {
+        let (says, agrees) = match (hint.multisig_only, hint.script) {
+            (false, Some(ScriptKind::Segwit)) => ("Native SegWit", kind == Wpkh),
+            (false, Some(ScriptKind::NestedSegwit)) => ("Nested SegWit", kind == ShWpkh),
+            (true, Some(ScriptKind::Segwit)) => (
+                "Native SegWit multisig",
+                matches!(kind, Wsh | WshSortedMulti),
+            ),
+            (true, Some(ScriptKind::NestedSegwit)) => (
+                "Nested SegWit multisig",
+                matches!(kind, ShWsh | ShWshSortedMulti),
+            ),
+            _ => continue,
+        };
+        if !agrees {
+            return Err(CoreError::InvalidInput {
+                kind: "descriptor",
+                detail: format!(
+                    "the key's {} prefix says {says}, but the descriptor wraps it in {}: \
+                     check the export",
+                    hint.prefix,
+                    descriptor_function(kind)
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The outer function of a descriptor, the way it is written.
+fn descriptor_function(kind: DescriptorType) -> &'static str {
+    match kind {
+        DescriptorType::Pkh => "pkh()",
+        DescriptorType::Wpkh => "wpkh()",
+        DescriptorType::ShWpkh => "sh(wpkh())",
+        DescriptorType::Tr => "tr()",
+        DescriptorType::Wsh | DescriptorType::WshSortedMulti => "wsh()",
+        DescriptorType::ShWsh | DescriptorType::ShWshSortedMulti => "sh(wsh())",
+        DescriptorType::Sh | DescriptorType::ShSortedMulti => "sh()",
+        _ => "a bare script",
+    }
+}
+
+fn parse_single_descriptor(s: &str) -> CoreResult<ParsedInput> {
+    let (s, hints) = xpub::normalize_descriptor_keys(s)?;
+    let descriptor = read_descriptor(&s)?;
+    check_slip132_hints(&hints, &descriptor)?;
+    let mut warnings = slip132_warning(!hints.is_empty());
+
+    if descriptor.is_multipath() {
+        let parts =
+            descriptor
+                .clone()
+                .into_single_descriptors()
+                .map_err(|e| CoreError::InvalidInput {
+                    kind: "descriptor",
+                    detail: format!("invalid multipath descriptor: {e}"),
+                })?;
+        if parts.len() != 2 {
+            return Err(CoreError::InvalidInput {
+                kind: "descriptor",
+                detail: format!(
+                    "multipath descriptors must have exactly 2 paths, found {}",
+                    parts.len()
+                ),
+            });
+        }
+        return Ok(ParsedInput {
+            kind: RecognizedKind::MultipathDescriptor,
+            networks: descriptor_networks(&parts[0])?,
+            payload: ParsedPayload::Descriptors {
+                external: parts[0].to_string(),
+                internal: Some(parts[1].to_string()),
+                script: script_kind_of(&parts[0]),
+            },
+            warnings,
+            script_options: vec![],
+            derivation: None,
+            derivation_editable: false,
+            preview_address: None,
+        });
+    }
+
+    if descriptor.has_wildcard() {
+        warnings.push(InputWarning::ChangeNotTracked);
+    }
+    Ok(ParsedInput {
+        kind: RecognizedKind::Descriptor,
+        networks: descriptor_networks(&descriptor)?,
+        payload: ParsedPayload::Descriptors {
+            external: descriptor.to_string(),
+            internal: None,
+            script: script_kind_of(&descriptor),
+        },
+        warnings,
+        script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
+        preview_address: None,
+    })
+}
+
+fn parse_descriptor_pair(first: &str, second: &str) -> CoreResult<ParsedInput> {
+    let (first, first_hints) = xpub::normalize_descriptor_keys(first)?;
+    let (second, second_hints) = xpub::normalize_descriptor_keys(second)?;
+    let external = read_descriptor(&first)?;
+    let internal = read_descriptor(&second)?;
+    check_slip132_hints(&first_hints, &external)?;
+    check_slip132_hints(&second_hints, &internal)?;
+    if external.is_multipath() || internal.is_multipath() {
+        return Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: "cannot combine a multipath descriptor with a second descriptor".to_owned(),
+        });
+    }
+    let external_networks = descriptor_networks(&external)?;
+    if external_networks != descriptor_networks(&internal)? {
+        return Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: "the two descriptors belong to different networks".to_owned(),
+        });
+    }
+    check_pair(&external, &internal)?;
+    Ok(ParsedInput {
+        kind: RecognizedKind::DescriptorPair,
+        networks: external_networks,
+        payload: ParsedPayload::Descriptors {
+            external: external.to_string(),
+            internal: Some(internal.to_string()),
+            script: script_kind_of(&external),
+        },
+        warnings: slip132_warning(!first_hints.is_empty() || !second_hints.is_empty()),
+        script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
+        preview_address: None,
+    })
+}
+
+/// A descriptor file as Sparrow exports it: the wallet once as one
+/// multipath descriptor, then as its receive and change descriptors,
+/// in any order. The multipath one is the wallet, and the other two
+/// must say the same, or the file is refused: one of the three would
+/// otherwise be watched, unread, in place of another.
+fn parse_descriptor_file(lines: &[&str]) -> CoreResult<ParsedInput> {
+    let refuse = |detail: &str| CoreError::InvalidInput {
+        kind: "descriptor",
+        detail: detail.to_owned(),
+    };
+    let mut parsed = lines
+        .iter()
+        .map(|line| parse_single_descriptor(line))
+        .collect::<CoreResult<Vec<_>>>()?;
+    let whole: Vec<usize> = (0..parsed.len())
+        .filter(|&i| parsed[i].kind == RecognizedKind::MultipathDescriptor)
+        .collect();
+    let [whole] = whole[..] else {
+        return Err(refuse(
+            "expected one multipath descriptor beside its receive and change descriptors",
+        ));
+    };
+    let pair: Vec<&str> = (0..lines.len())
+        .filter(|&i| i != whole)
+        .map(|i| lines[i])
+        .collect();
+    let wallet = parsed.swap_remove(whole);
+    let describes = |receive: &str, change: &str| -> CoreResult<bool> {
+        Ok(parse_descriptor_pair(receive, change)?.payload == wallet.payload)
+    };
+    if !(describes(pair[0], pair[1])? || describes(pair[1], pair[0])?) {
+        return Err(refuse(
+            "the descriptors in this file do not describe the same wallet",
+        ));
+    }
+    Ok(wallet)
+}
+
+/// Holds the change descriptor of a pair to the receive one. The two
+/// are one wallet: the same script type, the same keys with the same
+/// say, on other paths. The policy page reads the receive descriptor
+/// alone, and every payment's change goes to the other one: a pair
+/// that disagrees would vouch for one wallet and send change to
+/// another, which is what a coordinator could hide in it.
+fn check_pair(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    pair_holds(external, internal, true)
+}
+
+/// [`check_pair`] for a pair that reaches the engine without the
+/// parser's two-line reading: read back from a backup, handed back by
+/// the app, or split out of one multipath descriptor. It refuses what
+/// proves the two are not one wallet, and does not refuse a policy that
+/// cannot be lifted for being unreadable: two such branches are held to
+/// the same script on the same keys instead, and one that lifts beside
+/// one that does not is refused.
+pub(crate) fn check_stored_pair(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+) -> CoreResult<()> {
+    pair_holds(external, internal, false)
+}
+
+/// The two checks above: `unliftable_refused` says whether a policy that
+/// does not lift fails the pair.
+fn pair_holds(
+    external: &Descriptor<DescriptorPublicKey>,
+    internal: &Descriptor<DescriptorPublicKey>,
+    unliftable_refused: bool,
+) -> CoreResult<()> {
+    let refuse = |detail: &str| {
+        Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: detail.to_owned(),
+        })
+    };
+    if external.to_string() == internal.to_string() {
+        return refuse("the two descriptors are the same; change needs a path of its own");
+    }
+    let named = |what: &str, index: u32| {
+        Err(CoreError::InvalidInput {
+            kind: "descriptor",
+            detail: format!("{what} at index {index}; change needs a path of its own"),
+        })
+    };
+    if let Some(index) = address_of(external, internal) {
+        return named("the change descriptor is the receive address", index);
+    }
+    if let Some(index) = address_of(internal, external) {
+        return named("the receive descriptor is the change address", index);
+    }
+    if external.desc_type() != internal.desc_type() {
+        return refuse("the change descriptor is not of the receive descriptor's script type");
+    }
+    let another_wallet = || {
+        refuse(
+            "the change descriptor does not spend under the receive descriptor's keys and \
+             conditions: change would go to another wallet",
+        )
+    };
+    match (
+        crate::wallet::policy::policy_by_material(external),
+        crate::wallet::policy::policy_by_material(internal),
+    ) {
+        (Ok(receive), Ok(change)) if receive != change => another_wallet(),
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(unliftable), _) | (_, Err(unliftable)) if unliftable_refused => Err(unliftable),
+        // Two branches of one wallet lift alike: one that lifts beside
+        // one that does not, a raw hash swapped in for a key, is
+        // another wallet.
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => another_wallet(),
+        // Neither lifts: the two are held to the same script on the
+        // same keys, read whole instead of through their policies.
+        (Err(_), Err(_)) => {
+            let receive = crate::wallet::policy::descriptor_by_material(external);
+            match receive {
+                Some(receive)
+                    if Some(&receive)
+                        == crate::wallet::policy::descriptor_by_material(internal).as_ref() =>
+                {
+                    Ok(())
+                }
+                _ => another_wallet(),
+            }
+        }
+    }
+}
+
+/// The index of the address of `ranged` that `fixed` is, when it is
+/// one: a descriptor without a wildcard, beside one with it, that gives
+/// the same script as the ranged one at an index its own keys name, the
+/// last step of an extended key's path or of a single key's origin.
+/// Paired as receive and change, every payment's change would land on a
+/// receive address. Read on the keys alone, it refuses no wallet it does
+/// not prove; a key written another way (a bare key without an origin,
+/// a child key with its steps in the origin) goes unseen here, and the
+/// check of the keys' material refuses the latter as another wallet.
+fn address_of(
+    ranged: &Descriptor<DescriptorPublicKey>,
+    fixed: &Descriptor<DescriptorPublicKey>,
+) -> Option<u32> {
+    use bdk_wallet::bitcoin::bip32::ChildNumber;
+    // Deriving a hardened step panics in miniscript; reading refuses
+    // them before, and this holds without it.
+    if !ranged.has_wildcard()
+        || fixed.has_wildcard()
+        || hardened_derivation(ranged).is_some()
+        || hardened_derivation(fixed).is_some()
+    {
+        return None;
+    }
+    let script = fixed.at_derivation_index(0).ok()?.script_pubkey();
+    let mut named = Vec::new();
+    fixed.for_each_key(|key| {
+        let last = match key {
+            DescriptorPublicKey::XPub(xkey) => xkey.derivation_path.into_iter().last(),
+            DescriptorPublicKey::Single(single) => single
+                .origin
+                .as_ref()
+                .and_then(|(_, path)| path.into_iter().last()),
+            DescriptorPublicKey::MultiXPub(_) => None,
+        };
+        if let Some(ChildNumber::Normal { index }) = last
+            && !named.contains(index)
+        {
+            named.push(*index);
+        }
+        true
+    });
+    named.into_iter().find(|index| {
+        ranged
+            .at_derivation_index(*index)
+            .is_ok_and(|address| address.script_pubkey() == script)
+    })
+}
+
+// --- extended keys -----------------------------------------------------
+
+/// Builds the descriptors of a lone extended key: external on the
+/// receive branch, internal on the change branch when there is one.
+fn descriptors_for_xpub(
+    key: &str,
+    script: ScriptKind,
+    derivation: &DerivationChoice,
+) -> CoreResult<(String, Option<String>)> {
+    let origin = derivation.origin.as_deref().unwrap_or("");
+    let build = |branch: &str| -> CoreResult<String> {
+        let key = format!("{origin}{key}/{branch}");
+        let descriptor = match script {
+            ScriptKind::Legacy => format!("pkh({key})"),
+            ScriptKind::NestedSegwit => format!("sh(wpkh({key}))"),
+            ScriptKind::Segwit => format!("wpkh({key})"),
+            ScriptKind::Taproot => format!("tr({key})"),
+            other => {
+                return Err(CoreError::Internal(format!(
+                    "no single-key descriptor template for {other:?}"
+                )));
+            }
+        };
+        // Canonicalize through the parser: validates and appends checksums.
+        Ok(read_descriptor(&descriptor)?.to_string())
+    };
+    let external = build(&derivation.receive)?;
+    let internal = derivation.change.as_deref().map(build).transpose()?;
+    Ok((external, internal))
+}
+
+/// Splits a key-origin prefixed extended key, `[fingerprint/path]xpub…`,
+/// into its origin (brackets included) and the key. Returns `None` for
+/// anything else.
+fn split_key_origin(token: &str) -> Option<(&str, &str)> {
+    let rest = token.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let origin = &token[..close + 2];
+    let key = &rest[close + 1..];
+    (key.len() > 20 && xpub::looks_like_extended_key(key)).then_some((origin, key))
+}
+
+/// Script type implied by the purpose level of a key origin path
+/// (`[fp/84'/0'/0']`): BIP44, BIP49, BIP84, BIP86. `None` when the path
+/// starts elsewhere.
+fn script_from_origin(origin: &str) -> Option<ScriptKind> {
+    match origin_purpose(origin)? {
+        44 => Some(ScriptKind::Legacy),
+        49 => Some(ScriptKind::NestedSegwit),
+        84 => Some(ScriptKind::Segwit),
+        86 => Some(ScriptKind::Taproot),
+        _ => None,
+    }
+}
+
+/// The purpose level of a key origin path, the first step after the
+/// fingerprint, hardened or not.
+fn origin_purpose(origin: &str) -> Option<u32> {
+    let path = origin.trim_start_matches('[').trim_end_matches(']');
+    let purpose = path.split('/').nth(1)?;
+    purpose.trim_end_matches(['\'', 'h', 'H']).parse().ok()
+}
+
+/// First hardened index; a public key stops deriving right below it.
+const HARDENED_INDEX: u32 = 1 << 31;
+
+fn derivation_error(detail: String) -> CoreError {
+    CoreError::InvalidInput {
+        kind: "derivation path",
+        detail,
+    }
+}
+
+/// Longest step an error quotes: an index and its hardened mark,
+/// `2147483647'`, fits with room to spare.
+const MAX_QUOTED_STEP: usize = 12;
+
+/// A step as an error about it quotes it, after a space: one short
+/// enough to be an index, and nothing for a longer one. What was typed
+/// stays on screen in its field; a message never copies a long run of
+/// it, which could be a key pasted in the wrong place.
+fn quoted_step(step: &str) -> String {
+    if step.chars().count() <= MAX_QUOTED_STEP {
+        format!(" (`{step}`)")
+    } else {
+        String::new()
+    }
+}
+
+/// One step of a path: its index and whether it is hardened. The error
+/// is a sentence tail to hang after the path's name.
+fn parse_step(step: &str) -> Result<(u32, bool), String> {
+    if step.is_empty() {
+        return Err("has an empty step".to_owned());
+    }
+    let (digits, hardened) = match step.strip_suffix(['\'', 'h', 'H']) {
+        Some(digits) => (digits, true),
+        None => (step, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "has a step that is not a number{}",
+            quoted_step(step)
+        ));
+    }
+    let index = digits
+        .parse::<u32>()
+        .ok()
+        .filter(|index| *index < HARDENED_INDEX)
+        .ok_or_else(|| {
+            format!(
+                "has an index above {}{}",
+                HARDENED_INDEX - 1,
+                quoted_step(step)
+            )
+        })?;
+    Ok((index, hardened))
+}
+
+/// Checks a receive or change branch and returns it in canonical form.
+/// An extended public key only derives unhardened children, and the
+/// wildcard has to come last so that every address gets its own index.
+fn canonical_branch(path: &str, which: &str) -> CoreResult<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(derivation_error(format!(
+            "the {which} path is empty; wallets use `0/*` for receive and `1/*` for change"
+        )));
+    }
+    let refuse = |reason: String| derivation_error(format!("the {which} path {reason}"));
+    let steps = match path.strip_suffix('*') {
+        Some("") => "",
+        Some(steps) => steps
+            .strip_suffix('/')
+            .ok_or_else(|| refuse("must end with `/*`".to_owned()))?,
+        None => {
+            return Err(refuse(
+                "must end with `*`, the placeholder for the address index".to_owned(),
+            ));
+        }
+    };
+    let steps = steps.strip_prefix('/').unwrap_or(steps);
+    let mut canonical = Vec::new();
+    if !steps.is_empty() {
+        for step in steps.split('/') {
+            if step == "*" {
+                return Err(refuse(
+                    "has `*` before the end; it can only be the last step".to_owned(),
+                ));
+            }
+            let (index, hardened) = parse_step(step).map_err(refuse)?;
+            if hardened {
+                return Err(refuse(format!(
+                    "has a hardened step{}: an extended public key cannot derive hardened \
+                     children",
+                    quoted_step(step)
+                )));
+            }
+            canonical.push(index.to_string());
+        }
+    }
+    canonical.push("*".to_owned());
+    Ok(canonical.join("/"))
+}
+
+/// Where a key origin was read, which decides what an error about it
+/// quotes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginSource {
+    /// Typed by hand: it is on screen in its field already, and a
+    /// message never copies it back, since it could be a key pasted in
+    /// the wrong place.
+    Typed,
+    /// Read from a wallet export, every string of which went through the
+    /// private key filter: the message quotes what it read, the one way
+    /// to find the fault in a file nobody sees.
+    File,
+}
+
+/// Checks a key origin and returns it in canonical form,
+/// `[fingerprint/path]` with `'` on hardened steps, the way the
+/// descriptor prints it. Hardened steps are fine here: the origin
+/// records what the signer derived, not what this key will.
+fn canonical_origin(origin: &str, source: OriginSource) -> CoreResult<String> {
+    let origin = origin.trim();
+    let quoted = source == OriginSource::File;
+    let refuse = |reason: String| {
+        derivation_error(if quoted {
+            format!("the key origin `{origin}` {reason}")
+        } else {
+            format!("the key origin {reason}")
+        })
+    };
+    let inner = match origin
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+    {
+        Some(inner) => inner,
+        None if origin.starts_with('[') || origin.ends_with(']') => {
+            return Err(refuse(
+                "must be written between brackets, `[fingerprint/path]`".to_owned(),
+            ));
+        }
+        None => origin,
+    };
+    let mut steps = inner.split('/');
+    let fingerprint = steps.next().unwrap_or_default();
+    if fingerprint.len() != 8 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let reason = "must start with the master key fingerprint, 8 hexadecimal characters";
+        return Err(refuse(if quoted {
+            format!("{reason}, not `{fingerprint}`")
+        } else {
+            reason.to_owned()
+        }));
+    }
+    let mut canonical = fingerprint.to_ascii_lowercase();
+    for step in steps {
+        if step.contains('*') {
+            return Err(refuse(
+                "cannot contain a wildcard; `*` belongs to the receive and change paths".to_owned(),
+            ));
+        }
+        let (index, hardened) = parse_step(step).map_err(refuse)?;
+        canonical.push('/');
+        canonical.push_str(&index.to_string());
+        if hardened {
+            canonical.push('\'');
+        }
+    }
+    Ok(format!("[{canonical}]"))
+}
+
+/// The derivation in effect for a lone extended key: the user's choice
+/// when there is one, the BIP32 convention otherwise, and the origin
+/// the input carries unless the choice names another.
+fn effective_derivation(
+    input_origin: Option<&str>,
+    choice: Option<&DerivationChoice>,
+) -> CoreResult<DerivationChoice> {
+    let default = DerivationChoice::default();
+    let choice = choice.unwrap_or(&default);
+    // The three fields are typed by hand, beside the one the key was
+    // pasted in: a private key pasted in one of them is refused the way
+    // that field refuses it, before any message could quote it.
+    for field in [
+        Some(choice.receive.as_str()),
+        choice.change.as_deref(),
+        choice.origin.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        reject_private_material(field)?;
+    }
+    let receive = canonical_branch(&choice.receive, "receive")?;
+    let change = choice
+        .change
+        .as_deref()
+        .map(|change| canonical_branch(change, "change"))
+        .transpose()?;
+    if change.as_deref() == Some(receive.as_str()) {
+        return Err(derivation_error(format!(
+            "the receive and change paths are both `{receive}`; change needs its own branch"
+        )));
+    }
+    let origin = choice
+        .origin
+        .as_deref()
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .or(input_origin)
+        .map(|origin| canonical_origin(origin, OriginSource::Typed))
+        .transpose()?;
+    Ok(DerivationChoice {
+        receive,
+        change,
+        origin,
+    })
+}
+
+/// A lone extended key, with or without a key origin.
+///
+/// The script type comes, in order, from the SLIP-132 prefix (`ypub`,
+/// `zpub`, …), which no choice overrides, the user's explicit choice,
+/// the purpose of the origin path, and finally the BIP84 default with a
+/// warning. The branches come from the user's choice or the BIP32
+/// convention. The user may still switch the script when the prefix
+/// leaves it open, from `script_options`, and the paths always, from
+/// `derivation_editable`. An origin under purpose 45 or 48 is a
+/// multisig cosigner's, refused like a cosigner prefix: watched alone,
+/// such a key holds nothing.
+fn parse_extended_key(
+    token: &str,
+    origin: Option<&str>,
+    options: &ImportOptions,
+) -> CoreResult<ParsedInput> {
+    let decoded = xpub::decode_extended_key(token)?;
+    if decoded.multisig_only {
+        return Err(CoreError::InvalidInput {
+            kind: "extended key",
+            detail: "this prefix marks a multisig cosigner key; import the full multisig \
+                     descriptor instead"
+                .to_owned(),
+        });
+    }
+    if let Some(choice) = options.script
+        && !SINGLE_KEY_SCRIPTS.contains(&choice)
+    {
+        return Err(CoreError::InvalidInput {
+            kind: "script type",
+            detail: format!("{choice:?} cannot be built from a single key"),
+        });
+    }
+    let derivation = effective_derivation(origin, options.derivation.as_ref())?;
+    if derivation
+        .origin
+        .as_deref()
+        .and_then(origin_purpose)
+        .is_some_and(|purpose| matches!(purpose, 45 | 48))
+    {
+        return Err(CoreError::InvalidInput {
+            kind: "extended key",
+            detail: "this origin marks a multisig cosigner key; import the full multisig \
+                     descriptor instead"
+                .to_owned(),
+        });
+    }
+
+    let mut warnings = vec![];
+    if decoded.converted {
+        warnings.push(InputWarning::Slip132Converted);
+    }
+    let script = match (
+        decoded.script_hint,
+        options.script,
+        derivation.origin.as_deref().and_then(script_from_origin),
+    ) {
+        (Some(prefix), ..) => prefix,
+        (None, Some(choice), _) | (None, None, Some(choice)) => choice,
+        (None, None, None) => {
+            warnings.push(InputWarning::AssumedSegwit);
+            ScriptKind::Segwit
+        }
+    };
+    let script_options = match decoded.script_hint {
+        Some(_) => Vec::new(),
+        None => SINGLE_KEY_SCRIPTS.to_vec(),
+    };
+    let (external, internal) = descriptors_for_xpub(&decoded.normalized, script, &derivation)?;
+    if derivation.receive != RECEIVE_BRANCH || derivation.change.as_deref() != Some(CHANGE_BRANCH) {
+        warnings.push(InputWarning::NonStandardDerivation);
+    }
+    if internal.is_none() {
+        warnings.push(InputWarning::ChangeNotTracked);
+    }
+
+    Ok(ParsedInput {
+        kind: RecognizedKind::ExtendedKey,
+        networks: networks_for_kind(Some(decoded.network_kind)),
+        payload: ParsedPayload::Descriptors {
+            external,
+            internal,
+            script,
+        },
+        warnings,
+        script_options,
+        derivation: Some(derivation),
+        derivation_editable: true,
+        preview_address: None,
+    })
+}
+
+/// First receive address of a descriptor payload, on the network
+/// chosen when the input allows it, on the first candidate otherwise.
+/// Best effort: a descriptor that cannot derive (bare miniscript, no
+/// wildcard on a script we cannot address) yields `None` rather than
+/// an error, the import itself is unaffected.
+fn preview_address(parsed: &ParsedInput, chosen: Option<Network>) -> Option<String> {
+    let network = chosen
+        .filter(|network| parsed.networks.contains(network))
+        .or_else(|| parsed.networks.first().copied())?;
+    first_address(&parsed.payload, network)
+}
+
+/// The first receive address of descriptors on `network`.
+fn first_address(payload: &ParsedPayload, network: Network) -> Option<String> {
+    let ParsedPayload::Descriptors { external, .. } = payload else {
+        return None;
+    };
+    let descriptor = read_descriptor(external).ok()?;
+    let definite = descriptor.at_derivation_index(0).ok()?;
+    definite
+        .address(network.to_bitcoin())
+        .ok()
+        .map(|a| a.to_string())
+}
+
+// --- addresses ---------------------------------------------------------
+
+/// The address of a payment URI (BIP21, `bitcoin:bc1q…?amount=…`, the
+/// scheme in any case), as the receive screen of another wallet shows
+/// it in a QR code; the token itself otherwise.
+fn payment_address(token: &str) -> &str {
+    match token.get(..8) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("bitcoin:") => {
+            let rest = &token[8..];
+            rest.split_once('?').map_or(rest, |(address, _)| address)
+        }
+        _ => token,
+    }
+}
+
+fn classify_address(
+    address: Address<bdk_wallet::bitcoin::address::NetworkUnchecked>,
+) -> CoreResult<ParsedInput> {
+    let networks: Vec<Network> = Network::ALL
+        .into_iter()
+        .filter(|network| address.is_valid_for_network(network.to_bitcoin()))
+        .collect();
+    if networks.is_empty() {
+        return Err(CoreError::InvalidInput {
+            kind: "address",
+            detail: "address does not belong to any supported network".to_owned(),
+        });
+    }
+    // Canonical form: bech32 lowercased, base58 unchanged. The network
+    // itself was validated just above.
+    let canonical = address.assume_checked().to_string();
+    Ok(ParsedInput {
+        kind: RecognizedKind::Address,
+        networks,
+        payload: ParsedPayload::Address { address: canonical },
+        warnings: vec![],
+        script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
+        preview_address: None,
+    })
+}
+
+// --- wallet export files ----------------------------------------------
+
+/// Parses JSON wallet exports.
+///
+/// Supported today: a top-level `descriptor` field (with an optional
+/// `change_descriptor`), and Coldcard-style exports: `bip44`/`bip49`/
+/// `bip84`/`bip86` account objects, read through the account's own
+/// descriptor (`desc`) when it has one, else as its `xpub` on its
+/// `deriv` under the file's master fingerprint (`xfp`), and held to the
+/// `first` address they show. Other formats are reported as
+/// unrecognized.
+fn parse_json_export(input: &str) -> CoreResult<ParsedInput> {
+    let value: serde_json::Value =
+        serde_json::from_str(input).map_err(|e| CoreError::InvalidInput {
+            kind: "json",
+            detail: e.to_string(),
+        })?;
+    // Checked once more as decoded: a key written with JSON escapes,
+    // `5Hue…`, reads as nothing private in the raw text, and a
+    // parser that refused it later would quote it in its error.
+    reject_private_in_json(&value)?;
+
+    // Generic: { "descriptor": "...", "change_descriptor": "..."? }
+    if let Some(descriptor) = value.get("descriptor").and_then(|v| v.as_str()) {
+        let mut parsed = match value.get("change_descriptor").and_then(|v| v.as_str()) {
+            Some(change) => parse_descriptor_pair(descriptor, change)?,
+            None => parse_single_descriptor(descriptor)?,
+        };
+        parsed.kind = RecognizedKind::WalletExport;
+        return Ok(parsed);
+    }
+
+    // Coldcard-style: account objects keyed by BIP, modern first.
+    const ACCOUNTS: &[(&str, ScriptKind)] = &[
+        ("bip84", ScriptKind::Segwit),
+        ("bip86", ScriptKind::Taproot),
+        ("bip49", ScriptKind::NestedSegwit),
+        ("bip44", ScriptKind::Legacy),
+    ];
+    let present: Vec<&(&str, ScriptKind)> = ACCOUNTS
+        .iter()
+        .filter(|(key, _)| value.get(*key).map(|v| v.is_object()) == Some(true))
+        .collect();
+    if let Some((account_key, script)) = present.first() {
+        let account = &value[*account_key];
+        let export_error = |detail: String| CoreError::InvalidInput {
+            kind: "wallet export",
+            detail,
+        };
+        let mut parsed = match account.get("desc").and_then(|v| v.as_str()) {
+            // The account's own descriptor: its origin carries the master
+            // fingerprint, the one a signer knows the wallet by.
+            Some(desc) => {
+                let parsed = parse_single_descriptor(desc)?;
+                if !matches!(&parsed.payload, ParsedPayload::Descriptors { script: s, .. } if s == script)
+                {
+                    return Err(export_error(format!(
+                        "`{account_key}` holds a descriptor for another script type"
+                    )));
+                }
+                parsed
+            }
+            None => coldcard_account(&value, account, account_key, *script)?,
+        };
+        // The address the exporting device showed for the account, the
+        // check its user can make by eye.
+        if let Some(first) = account.get("first").and_then(|v| v.as_str())
+            && !derives_first(&parsed, first)
+        {
+            return Err(export_error(format!(
+                "the first address of `{account_key}` ({first}) is not the one its key \
+                 derives; the file may be altered"
+            )));
+        }
+        parsed.kind = RecognizedKind::WalletExport;
+        if present.len() > 1 {
+            parsed.warnings.push(InputWarning::MultipleAccountsInFile);
+        }
+        return Ok(parsed);
+    }
+
+    Err(CoreError::UnrecognizedInput(
+        "JSON file is not a recognized wallet export".to_owned(),
+    ))
+}
+
+/// [`reject_private_material`] over every string of a JSON document,
+/// names and values alike.
+fn reject_private_in_json(value: &serde_json::Value) -> CoreResult<()> {
+    match value {
+        serde_json::Value::String(text) => reject_private_material(text),
+        serde_json::Value::Array(items) => items.iter().try_for_each(reject_private_in_json),
+        serde_json::Value::Object(fields) => fields.iter().try_for_each(|(name, value)| {
+            reject_private_material(name)?;
+            reject_private_in_json(value)
+        }),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            Ok(())
+        }
+    }
+}
+
+/// An account of a Coldcard-style export without a descriptor of its
+/// own: its key, on its path, under the file's master fingerprint. The
+/// `xfp` beside an account is the fingerprint of the account key
+/// itself, which no signer knows the wallet by, and is left out.
+fn coldcard_account(
+    file: &serde_json::Value,
+    account: &serde_json::Value,
+    account_key: &str,
+    script: ScriptKind,
+) -> CoreResult<ParsedInput> {
+    let export_error = |detail: String| CoreError::InvalidInput {
+        kind: "wallet export",
+        detail,
+    };
+    let key = account
+        .get("xpub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| export_error(format!("`{account_key}` entry has no xpub")))?;
+    let decoded = xpub::decode_extended_key(key)?;
+    // Held to its prefix as a pasted key is: a SLIP-132 key names its
+    // script, and a cosigner key is no single-key account.
+    if decoded.multisig_only {
+        return Err(export_error(format!(
+            "`{account_key}` holds a multisig cosigner key; import the full multisig \
+             descriptor instead"
+        )));
+    }
+    if let Some(hint) = decoded.script_hint
+        && hint != script
+    {
+        return Err(export_error(format!(
+            "`{account_key}` holds a key whose prefix is for another script type"
+        )));
+    }
+
+    let fingerprint = file.get("xfp").and_then(|v| v.as_str());
+    let path = account
+        .get("deriv")
+        .and_then(|v| v.as_str())
+        .map(|deriv| deriv.trim_start_matches('m').trim_start_matches('/'));
+    let origin = match (fingerprint, path) {
+        (Some(fingerprint), Some("")) => Some(canonical_origin(fingerprint, OriginSource::File)?),
+        (Some(fingerprint), Some(path)) => Some(canonical_origin(
+            &format!("[{fingerprint}/{path}]"),
+            OriginSource::File,
+        )?),
+        _ => None,
+    };
+    let derivation = DerivationChoice {
+        origin,
+        ..DerivationChoice::default()
+    };
+    let (external, internal) = descriptors_for_xpub(&decoded.normalized, script, &derivation)?;
+    Ok(ParsedInput {
+        kind: RecognizedKind::WalletExport,
+        networks: networks_for_kind(Some(decoded.network_kind)),
+        payload: ParsedPayload::Descriptors {
+            external,
+            internal,
+            script,
+        },
+        warnings: slip132_warning(decoded.converted),
+        script_options: vec![],
+        derivation: None,
+        derivation_editable: false,
+        preview_address: None,
+    })
+}
+
+/// Whether `first` is the first receive address the descriptors
+/// derive, on any of the input's candidate networks: the test networks
+/// share one key encoding, and regtest spells its addresses its own way.
+fn derives_first(parsed: &ParsedInput, first: &str) -> bool {
+    let ParsedPayload::Descriptors { external, .. } = &parsed.payload else {
+        return false;
+    };
+    let Ok(descriptor) = read_descriptor(external) else {
+        return false;
+    };
+    let Ok(definite) = descriptor.at_derivation_index(0) else {
+        return false;
+    };
+    parsed.networks.iter().any(|network| {
+        definite
+            .address(network.to_bitcoin())
+            .is_ok_and(|address| address.to_string().eq_ignore_ascii_case(first.trim()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use bdk_wallet::miniscript::descriptor::checksum::desc_checksum;
+
+    use super::*;
+
+    /// Public two-path descriptor from the BDK documentation.
+    const MULTIPATH: &str = "wpkh([9a6a2580/84'/1'/0']tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/<0;1>/*)";
+    const TPUB: &str = "tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks";
+    /// BIP32 test vector 1, master public key.
+    const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+    /// BIP32 test vector 1, chain m/0H.
+    const XPUB_B: &str = "xpub68Gmy5EdvgibQVfPdqkBBCHxA5htiqg55crXYuXoQRKfDBFA1WEjWgP6LHhwBZeNK1VTsfTFUHCdrfp1bgwQ9xv5ski8PX9rL2dZXvgGDnw";
+    /// BIP32 test vector 1, chain m/0H/1.
+    const XPUB_C: &str = "xpub6ASuArnXKPbfEwhqN6e3mwBcDTgzisQN1wXN9BJcM47sSikHjJf3UFHKkNAWbWMiGj7Wf5uMash7SyYq527Hqck2AxYysAA7xmALppuCkwQ";
+    /// First receive address of `TPUB` on the default derivation.
+    const DEFAULT_PREVIEW: &str = "tb1qh9ruph54tnfveh7dtve3nrfx26p56rx4q4l0zx";
+    /// BIP32 test vector 1, master private key: the one private key
+    /// these tests may spell, because everybody already knows it.
+    const TPRV: &str = "tprv8ZgxMBicQKsPdy6LMhUtFHAgpocR8GC6QmwMSFpZs7h6Eziw3SpThFfczTDh5rW2krkqffa11UpX3XkeTTB2FvzZKWXqPY54Y6Rq4AQ5R8L";
+
+    /// SLIP-132 version bytes: public single-sig test, native (`vpub`)
+    /// and nested (`upub`); public multisig test, native (`Vpub`) and
+    /// nested (`Upub`); public main, single-sig (`zpub`) and multisig
+    /// (`Zpub`); and private single-sig test (`vprv`).
+    const VPUB: [u8; 4] = [0x04, 0x5F, 0x1C, 0xF6];
+    const UPUB: [u8; 4] = [0x04, 0x4A, 0x52, 0x62];
+    const VPUB_MULTI: [u8; 4] = [0x02, 0x57, 0x54, 0x83];
+    const UPUB_MULTI: [u8; 4] = [0x02, 0x42, 0x89, 0xEF];
+    const ZPUB: [u8; 4] = [0x04, 0xB2, 0x47, 0x46];
+    const ZPUB_MULTI: [u8; 4] = [0x02, 0xAA, 0x7E, 0xD3];
+    const VPRV: [u8; 4] = [0x04, 0x5F, 0x18, 0xBC];
+
+    /// `key` re-encoded under other version bytes, the way a wallet
+    /// exporting SLIP-132 spells the very same key.
+    fn slip132(key: &str, version: [u8; 4]) -> String {
+        let mut data = base58::decode_check(key).unwrap();
+        data[..4].copy_from_slice(&version);
+        base58::encode_check(&data)
+    }
+
+    fn with_derivation(receive: &str, change: Option<&str>, origin: Option<&str>) -> ImportOptions {
+        ImportOptions {
+            derivation: Some(DerivationChoice {
+                receive: receive.to_owned(),
+                change: change.map(str::to_owned),
+                origin: origin.map(str::to_owned),
+            }),
+            ..ImportOptions::default()
+        }
+    }
+
+    fn on(network: Network) -> ImportOptions {
+        ImportOptions {
+            network: Some(network),
+            ..ImportOptions::default()
+        }
+    }
+
+    /// What a bech32 address carries between its prefix and its
+    /// checksum: the witness program, the same on every network.
+    fn program(address: &str) -> &str {
+        let (_, data) = address.split_once('1').unwrap();
+        &data[..data.len() - 6]
+    }
+
+    fn descriptors(parsed: &ParsedInput) -> (&str, Option<&str>, ScriptKind) {
+        match &parsed.payload {
+            ParsedPayload::Descriptors {
+                external,
+                internal,
+                script,
+            } => (external, internal.as_deref(), *script),
+            other => panic!("expected descriptors, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multipath_descriptor_splits_into_pair() {
+        let parsed = parse_input(MULTIPATH).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        let (external, internal, script) = descriptors(&parsed);
+        assert!(external.contains("/0/*"));
+        assert!(internal.unwrap().contains("/1/*"));
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.contains('#'), "canonical form carries a checksum");
+        assert_eq!(
+            parsed.networks,
+            vec![Network::Signet, Network::Testnet4, Network::Regtest]
+        );
+    }
+
+    /// A descriptor written with a SLIP-132 key reads exactly as the
+    /// same descriptor written with the standard key, plus the notice
+    /// that the key was rewritten, when the prefix and the function
+    /// agree, as an export's do.
+    #[test]
+    fn a_slip132_key_inside_a_descriptor_is_read_as_the_standard_one() {
+        let vpub = slip132(TPUB, VPUB);
+        assert!(vpub.starts_with("vpub"));
+        let parsed = parse_input(&MULTIPATH.replace(TPUB, &vpub)).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        assert_eq!(
+            parsed.networks,
+            vec![Network::Signet, Network::Testnet4, Network::Regtest]
+        );
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([9a6a2580/84'/1'/0']tpub"));
+        assert!(!external.contains(&vpub));
+        assert!(internal.unwrap().contains("/1/*"));
+
+        let standard = parse_input(MULTIPATH).unwrap();
+        assert_eq!(descriptors(&parsed), descriptors(&standard));
+        assert_eq!(parsed.preview_address, standard.preview_address);
+        assert!(parsed.script_options.is_empty());
+        assert!(!parsed.derivation_editable);
+    }
+
+    /// The checksum covers the text as written: rewriting a key inside
+    /// it makes it stale, so it is recomputed. One that was wrong to
+    /// begin with is still refused, before any key is looked at.
+    #[test]
+    fn a_checksummed_slip132_descriptor_is_accepted() {
+        let vpub = slip132(TPUB, VPUB);
+        let body = format!("wpkh({vpub}/0/*)");
+        let input = format!("{body}#{}", desc_checksum(&body).unwrap());
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Descriptor);
+        assert!(parsed.warnings.contains(&InputWarning::Slip132Converted));
+        let (external, _, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+
+        let error = parse_input(&format!("{body}#00000000"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("checksum"), "{error}");
+    }
+
+    #[test]
+    fn a_pair_of_slip132_descriptors_is_said_to_be_converted_once() {
+        let vpub = slip132(TPUB, VPUB);
+        let input = format!("wpkh({vpub}/0/*)\nwpkh({vpub}/1/*)");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert_eq!(internal.unwrap(), format!("wpkh({TPUB}/1/*)#u0jxnq94"));
+
+        // One converted line is enough to say so.
+        let input = format!("wpkh({TPUB}/0/*)\nwpkh({vpub}/1/*)");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+    }
+
+    #[test]
+    fn a_descriptor_may_spell_its_keys_both_ways() {
+        let cosigner = slip132(XPUB, ZPUB_MULTI);
+        let input = format!("wsh(multi(1,{XPUB}/<0;1>/*,{cosigner}/<2;3>/*))");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.networks, vec![Network::Mainnet]);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert_eq!(external.matches(XPUB).count(), 2, "{external}");
+    }
+
+    /// The multisig prefixes are refused on their own, since a lone
+    /// cosigner key makes no wallet; inside the multisig descriptor
+    /// they were exported for, they read as the keys they are.
+    #[test]
+    fn multisig_prefixes_are_read_inside_a_multisig_descriptor() {
+        let cosigner = slip132(TPUB, VPUB_MULTI);
+        assert!(cosigner.starts_with("Vpub"));
+        let input = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{cosigner}/<0;1>/*,[00000000/48'/1'/0'/2']{cosigner}/<2;3>/*))"
+        );
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(external.starts_with("wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']tpub"));
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
+
+        let error = parse_input(&cosigner).unwrap_err().to_string();
+        assert!(error.contains("multisig"), "{error}");
+    }
+
+    /// A rewritten key keeps its network: a mainnet `zpub` next to a
+    /// test `tpub` is the same mix it was, and refused the same way.
+    #[test]
+    fn a_slip132_key_keeps_its_network_inside_a_descriptor() {
+        let cosigner = slip132(XPUB, ZPUB_MULTI);
+        let error = parse_input(&format!("wsh(multi(1,{cosigner}/0/*,{TPUB}/0/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("mixes mainnet and test"), "{error}");
+    }
+
+    /// The prefix names the script the key was exported for, and the
+    /// descriptor has to agree: a `zpub` under `pkh()`, `tr()` or a
+    /// multisig, a `upub` under `wpkh()`, is a descriptor written for
+    /// another key, and the addresses it derives are not the exporting
+    /// wallet's. Refused naming both, on either line of a pair.
+    #[test]
+    fn a_slip132_prefix_the_descriptor_contradicts_is_refused() {
+        let zpub = slip132(XPUB, ZPUB);
+        let error = parse_input(&format!("pkh({zpub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's zpub prefix says Native SegWit, but the descriptor \
+             wraps it in pkh(): check the export"
+        );
+        let error = parse_input(&format!("tr({zpub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wraps it in tr()"), "{error}");
+        let error = parse_input(&format!("wsh(multi(1,{zpub}/0/*,{XPUB}/0/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("says Native SegWit, but the descriptor wraps it in wsh()"),
+            "{error}"
+        );
+
+        let upub = slip132(TPUB, UPUB);
+        let error = parse_input(&format!("wpkh({upub}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's upub prefix says Nested SegWit, but the descriptor \
+             wraps it in wpkh(): check the export"
+        );
+
+        let vpub = slip132(TPUB, VPUB);
+        let error = parse_input(&format!("wpkh({vpub}/0/*)\nsh(wpkh({vpub}/1/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("wraps it in sh(wpkh())"), "{error}");
+    }
+
+    /// A prefix that agrees with the function passes with the notice
+    /// that the key was rewritten, and nothing else: `upub` under
+    /// `sh(wpkh())`, `Upub` under `sh(wsh())`.
+    #[test]
+    fn a_slip132_prefix_the_descriptor_agrees_with_is_read() {
+        let upub = slip132(TPUB, UPUB);
+        let parsed = parse_input(&format!("sh(wpkh({upub}/<0;1>/*))")).unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::NestedSegwit);
+        assert!(external.starts_with("sh(wpkh(tpub"), "{external}");
+
+        let cosigner = slip132(TPUB, UPUB_MULTI);
+        let parsed = parse_input(&format!(
+            "sh(wsh(sortedmulti(1,{cosigner}/<0;1>/*,{TPUB}/<2;3>/*)))"
+        ))
+        .unwrap();
+        assert_eq!(parsed.warnings, vec![InputWarning::Slip132Converted]);
+        assert_eq!(descriptors(&parsed).2, ScriptKind::WitnessScript);
+    }
+
+    /// A multisig prefix marks a cosigner key: under a single-key
+    /// function it was pasted where it does not belong, and under the
+    /// other multisig wrapper it was exported for another setup.
+    #[test]
+    fn a_multisig_prefix_in_a_single_key_descriptor_is_refused() {
+        let cosigner = slip132(TPUB, VPUB_MULTI);
+        let error = parse_input(&format!("wpkh({cosigner}/0/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "invalid descriptor: the key's Vpub prefix says Native SegWit multisig, but the \
+             descriptor wraps it in wpkh(): check the export"
+        );
+        let error = parse_input(&format!("sh(wsh(multi(1,{cosigner}/0/*,{TPUB}/0/*)))"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("says Native SegWit multisig, but the descriptor wraps it in sh(wsh())"),
+            "{error}"
+        );
+    }
+
+    /// The rewrite only touches descriptors: an address is not scanned
+    /// for keys, a JSON export is read field by field, and a field that
+    /// holds a descriptor is read like a pasted one.
+    #[test]
+    fn the_rewrite_reaches_descriptors_and_nothing_else() {
+        let address = parse_input("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert!(address.warnings.is_empty());
+
+        let standard = parse_input(&format!("{{\"descriptor\": \"wpkh({TPUB}/0/*)\"}}")).unwrap();
+        assert!(!standard.warnings.contains(&InputWarning::Slip132Converted));
+
+        let vpub = slip132(TPUB, VPUB);
+        let export = parse_input(&format!("{{\"descriptor\": \"wpkh({vpub}/0/*)\"}}")).unwrap();
+        assert_eq!(export.kind, RecognizedKind::WalletExport);
+        assert!(export.warnings.contains(&InputWarning::Slip132Converted));
+        let (external, _, _) = descriptors(&export);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+
+        // A Coldcard-style export names its script by account, and its
+        // key is decoded as a key, not rewritten as text.
+        let zpub = slip132(XPUB, ZPUB);
+        let coldcard = parse_input(&format!(
+            "{{\"xfp\": \"0F056943\", \"bip84\": {{\"xpub\": \"{zpub}\", \"deriv\": \"m/84'/0'/0'\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(coldcard.kind, RecognizedKind::WalletExport);
+        let (external, _, script) = descriptors(&coldcard);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.contains(XPUB));
+
+        // Its key is held to its prefix as a pasted one is: a cosigner
+        // key, or one whose prefix names another script, would derive
+        // addresses the exporting wallet never shows.
+        for key in [slip132(XPUB, ZPUB_MULTI), slip132(TPUB, UPUB)] {
+            let export = format!(
+                "{{\"xfp\": \"0F056943\", \"bip84\": {{\"xpub\": \"{key}\", \"deriv\": \"m/84'/0'/0'\"}}}}"
+            );
+            assert!(
+                matches!(
+                    parse_input(&export),
+                    Err(CoreError::InvalidInput {
+                        kind: "wallet export",
+                        ..
+                    })
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slip132_private_key_inside_a_descriptor_is_rejected() {
+        let vprv = slip132(TPRV, VPRV);
+        assert!(vprv.starts_with("vprv"));
+        assert!(matches!(
+            parse_input(&format!("wpkh({vprv}/0/*)")),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+        assert!(matches!(
+            parse_input(&format!("wpkh({vprv}/0/*)\nwpkh({vprv}/1/*)")),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    #[test]
+    fn single_descriptor_warns_about_change() {
+        let single = format!("wpkh({TPUB}/0/*)");
+        let parsed = parse_input(&single).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Descriptor);
+        assert!(parsed.warnings.contains(&InputWarning::ChangeNotTracked));
+        let (_, internal, _) = descriptors(&parsed);
+        assert!(internal.is_none());
+    }
+
+    #[test]
+    fn a_backup_is_refused_by_name() {
+        let refused = |input: &str| {
+            let error = parse_input(input).unwrap_err();
+            assert!(
+                matches!(error, CoreError::InvalidInput { kind: "backup", .. }),
+                "{error}"
+            );
+            assert!(error.to_string().contains("restore it"), "{error}");
+        };
+        refused("gerfaut-backup:R0ZCQUNLVVAAAQ==");
+        // The same backup scanned as a single ur:bytes frame.
+        let mut bytes = crate::store::cipher::BACKUP_MAGIC.to_vec();
+        bytes.extend([1u8; 20]);
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&ciborium::Value::Bytes(bytes), &mut cbor).unwrap();
+        refused(&ur::ur::encode(&cbor, &ur::ur::Type::Bytes));
+    }
+
+    /// One envelope is opened, never one inside another: no wallet
+    /// nests them, and every level opened would cost the stack a frame.
+    #[test]
+    fn an_envelope_inside_an_envelope_is_refused() {
+        let wrap = |text: &str| {
+            let mut cbor = Vec::new();
+            ciborium::into_writer(&ciborium::Value::Bytes(text.as_bytes().to_vec()), &mut cbor)
+                .unwrap();
+            ur::ur::encode(&cbor, &ur::ur::Type::Bytes)
+        };
+        let once = wrap(MULTIPATH);
+        assert_eq!(
+            parse_input(&once).unwrap().kind,
+            RecognizedKind::MultipathDescriptor
+        );
+        let error = parse_input(&wrap(&once)).unwrap_err();
+        assert!(
+            matches!(error, CoreError::InvalidInput { kind: "qr", .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("holds another QR code"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_lines_form_a_pair() {
+        let input = format!("wpkh({TPUB}/0/*)\nwpkh({TPUB}/1/*)");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    /// A pair whose two branches begin with the same address under two
+    /// spellings, a key origin added or the keys of a `sortedmulti` in
+    /// another order, reads as one wallet on two branches; the engine
+    /// refuses it, and so does reading it, before anyone asks to add it.
+    #[test]
+    fn a_pair_the_engine_finds_the_same_is_refused_at_reading() {
+        for (external, internal) in [
+            (
+                format!("wpkh({TPUB}/0/*)"),
+                format!("wpkh([d34db33f/84h/1h/0h]{TPUB}/0/*)"),
+            ),
+            (
+                format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/1/*))"),
+                format!("wsh(sortedmulti(1,{TPUB}/1/*,{TPUB}/0/*))"),
+            ),
+        ] {
+            let error = parse_input(&format!("{external}\n{internal}")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid descriptor: the two descriptors begin with the same address; change \
+                 needs a path of its own",
+                "{external} / {internal}"
+            );
+        }
+    }
+
+    /// `TPUB` re-encoded at another depth: a key a forged export or QR
+    /// code could carry.
+    fn at_depth(depth: u8) -> String {
+        let mut data = base58::decode_check(TPUB).unwrap();
+        data[4] = depth;
+        base58::encode_check(&data)
+    }
+
+    /// An extended key too deep to derive its addresses is refused at
+    /// reading, in words, whatever form carries it; before, miniscript
+    /// panicked on its first address. One step short of the limit is a
+    /// key like any other.
+    #[test]
+    fn a_key_too_deep_to_derive_is_refused_not_a_panic() {
+        let deep = at_depth(255);
+        let almost = at_depth(254);
+        for input in [
+            deep.clone(),
+            format!("wpkh({deep}/0/*)"),
+            format!("wpkh({deep}/*)"),
+            format!("wpkh({almost}/0/*)"),
+            format!("wpkh({deep}/<0;1>/*)"),
+            format!("wpkh([d34db33f/84h/1h/0h]{deep}/0/*)"),
+            format!("wsh(sortedmulti(1,{TPUB}/0/*,{deep}/0/*))"),
+            format!("tr({deep}/0/*)"),
+            format!("wpkh({deep}/0/*)\nwpkh({deep}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("past depth 255, the deepest a BIP32 key can be"),
+                "{input}: {error}"
+            );
+        }
+        // A lone key whose path, edited, would go past the limit.
+        let edited = ImportOptions {
+            derivation: Some(DerivationChoice {
+                receive: "0/0/0/0/*".to_owned(),
+                change: Some("1/*".to_owned()),
+                origin: None,
+            }),
+            ..ImportOptions::default()
+        };
+        let error = parse_input_with_options(&at_depth(251), &edited).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid descriptor: an extended public key at depth 251 cannot derive its \
+             addresses: the 5 steps written after it go past depth 255, the deepest a BIP32 \
+             key can be"
+        );
+        let one = parse_input(&format!("wpkh({deep}/*)"))
+            .unwrap_err()
+            .to_string();
+        assert!(one.contains("the step written after it goes past"), "{one}");
+        // At the limit, not past it.
+        assert!(parse_input(&format!("wpkh({almost}/*)")).is_ok());
+        assert!(parse_input(&format!("wpkh({deep})")).is_ok());
+    }
+
+    /// A bare descriptor has no address: it is refused at reading,
+    /// where it used to be added and then crash the receive screen.
+    /// Wrapped, the same script is a wallet like any other.
+    #[test]
+    fn a_bare_descriptor_is_refused_at_reading() {
+        for input in [
+            format!("pk({TPUB}/0/*)"),
+            format!("multi(1,{TPUB}/0/*,{TPUB}/1/*)"),
+            format!("pk({TPUB}/0/*)\npk({TPUB}/1/*)"),
+        ] {
+            let error = parse_input(&input).unwrap_err().to_string();
+            assert!(
+                error.contains("a bare descriptor has no address"),
+                "{input}: {error}"
+            );
+        }
+        assert!(parse_input(&format!("sh(pk({TPUB}/0/*))")).is_ok());
+    }
+
+    /// A multisig that names one key twice is refused at reading, as
+    /// the engine refuses it, not after "Add wallet".
+    #[test]
+    fn a_key_repeated_in_a_multisig_is_refused_at_reading() {
+        let error = parse_input(&format!("wsh(multi(1,{TPUB}/<0;1>/*,{TPUB}/<0;1>/*))"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("repeated pubkeys"), "{error}");
+    }
+
+    /// A change descriptor that is one receive address, named by the
+    /// last step of its key's path or of its origin, is refused: every
+    /// change would land there. A fixed change address that is no
+    /// receive address is left alone, as is a pair of ranged branches.
+    #[test]
+    fn a_change_that_is_a_receive_address_is_refused() {
+        let receive = format!("wpkh({TPUB}/0/*)");
+        let refused = |internal: &str| {
+            parse_input(&format!("{receive}\n{internal}"))
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(&format!("wpkh({TPUB}/0/1)")),
+            "invalid descriptor: the change descriptor is the receive address at index 1; \
+             change needs a path of its own"
+        );
+        assert!(refused(&format!("wpkh({TPUB}/0/0)")).contains("at index 0"));
+        // A fixed change address of the same key elsewhere: no proof.
+        let other = format!("{receive}\nwpkh({TPUB}/1/0)");
+        assert_eq!(
+            parse_input(&other).unwrap().kind,
+            RecognizedKind::DescriptorPair
+        );
+        // And a backup holding such a pair is refused alike.
+        let stored = |internal: &str| {
+            check_stored_pair(&receive.parse().unwrap(), &internal.parse().unwrap())
+        };
+        assert!(stored(&format!("wpkh({TPUB}/0/7)")).is_err());
+        assert!(stored(&format!("wpkh({TPUB}/1/*)")).is_ok());
+        // The other way round: a fixed receive address that the change
+        // branch derives at the index it names.
+        let reversed = parse_input(&format!("wpkh({TPUB}/1/3)\nwpkh({TPUB}/1/*)"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            reversed,
+            "invalid descriptor: the receive descriptor is the change address at index 3; \
+             change needs a path of its own"
+        );
+        // The same address as a bare key, its origin naming the step,
+        // which reading refuses already for its network.
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::verification_only();
+        let fifth = receive
+            .parse::<Descriptor<DescriptorPublicKey>>()
+            .unwrap()
+            .at_derivation_index(5)
+            .unwrap()
+            .derived_descriptor(&secp)
+            .unwrap()
+            .to_string();
+        let key = &fifth[fifth.find('(').unwrap() + 1..fifth.find(')').unwrap()];
+        let bare = stored(&format!("wpkh([d34db33f/84h/1h/0h/0/5]{key})")).unwrap_err();
+        assert!(bare.to_string().contains("at index 5"), "{bare}");
+    }
+
+    /// The change descriptor of a pair is held to the receive one: the
+    /// policy page reads the receive one alone, and every change goes
+    /// to the other. Same script type, same keys with the same say, on
+    /// other paths and in any order.
+    #[test]
+    fn a_pair_is_one_wallet_or_nothing() {
+        let refused = |external: String, internal: String| match parse_input(&format!(
+            "{external}\n{internal}"
+        )) {
+            Err(CoreError::InvalidInput {
+                kind: "descriptor",
+                detail,
+            }) => detail,
+            other => panic!("{external} / {internal} should be refused, got {other:?}"),
+        };
+        // A multisig whose change goes to one key.
+        let detail = refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(1,{XPUB_C}/1/*,{XPUB_C}/2/*))"),
+        );
+        assert!(detail.contains("another wallet"), "{detail}");
+        // The same keys, another threshold.
+        refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(1,{XPUB}/1/*,{XPUB_B}/1/*,{XPUB_C}/1/*))"),
+        );
+        // One key standing in for another.
+        refused(
+            format!("wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))"),
+            format!("wsh(sortedmulti(2,{XPUB}/1/*,{XPUB_B}/1/*,{XPUB}/2/*))"),
+        );
+        // A recovery path that opens sooner on change.
+        refused(
+            format!("wsh(or_d(pk({XPUB}/0/*),and_v(v:pkh({XPUB_B}/0/*),older(52560))))"),
+            format!("wsh(or_d(pk({XPUB}/1/*),and_v(v:pkh({XPUB_B}/1/*),older(4320))))"),
+        );
+        // Another script type, the same key.
+        let detail = refused(format!("wpkh({XPUB}/0/*)"), format!("tr({XPUB}/1/*)"));
+        assert!(detail.contains("script type"), "{detail}");
+        // The same line twice.
+        let detail = refused(format!("wpkh({XPUB}/0/*)"), format!("wpkh({XPUB}/0/*)"));
+        assert!(detail.contains("the same"), "{detail}");
+
+        // The keys in another order, on the change paths: one wallet.
+        let parsed = parse_input(&format!(
+            "wsh(sortedmulti(2,{XPUB}/0/*,{XPUB_B}/0/*,{XPUB_C}/0/*))\n\
+             wsh(sortedmulti(2,{XPUB_C}/1/*,{XPUB}/1/*,{XPUB_B}/1/*))"
+        ))
+        .unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::DescriptorPair);
+    }
+
+    #[test]
+    fn bare_tpub_assumes_segwit() {
+        let parsed = parse_input(TPUB).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::ExtendedKey);
+        assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh("));
+        assert!(external.contains("/0/*"));
+        assert!(internal.unwrap().contains("/1/*"));
+        assert_eq!(parsed.script_options, SINGLE_KEY_SCRIPTS.to_vec());
+        let preview = parsed.preview_address.as_deref().unwrap();
+        assert!(preview.starts_with("tb1q"), "{preview}");
+    }
+
+    /// The first address is the one the wallet shows on the network it
+    /// is added on. Signet and testnet 4 share the `tb1` prefix.
+    #[test]
+    fn the_preview_follows_a_chosen_signet() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Signet)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    #[test]
+    fn the_preview_follows_a_chosen_testnet4() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Testnet4)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    /// Regtest was shown a `tb1` address, which no regtest wallet ever
+    /// gives: the same key reads `bcrt1` there, on the same program.
+    #[test]
+    fn the_preview_follows_a_chosen_regtest() {
+        let parsed = parse_input_with_options(TPUB, &on(Network::Regtest)).unwrap();
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("bcrt1q"), "{preview}");
+        assert_eq!(program(&preview), program(DEFAULT_PREVIEW));
+
+        // A descriptor follows it too, and so does a script picked again.
+        let parsed = parse_input_with_options(MULTIPATH, &on(Network::Regtest)).unwrap();
+        assert!(parsed.preview_address.unwrap().starts_with("bcrt1q"));
+        let taproot = parse_input_with_options(
+            TPUB,
+            &ImportOptions {
+                script: Some(ScriptKind::Taproot),
+                ..on(Network::Regtest)
+            },
+        )
+        .unwrap();
+        assert!(taproot.preview_address.unwrap().starts_with("bcrt1p"));
+    }
+
+    #[test]
+    fn the_preview_follows_a_chosen_mainnet() {
+        let parsed = parse_input_with_options(XPUB, &on(Network::Mainnet)).unwrap();
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("bc1q"), "{preview}");
+
+        // A network the key does not allow changes nothing: a main key
+        // has no regtest address, and a test key no mainnet one.
+        let parsed = parse_input_with_options(XPUB, &on(Network::Regtest)).unwrap();
+        assert_eq!(parsed.preview_address, Some(preview));
+        let parsed = parse_input_with_options(TPUB, &on(Network::Mainnet)).unwrap();
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    #[test]
+    fn chosen_script_rebuilds_the_descriptors() {
+        let taproot = parse_input_with(TPUB, Some(ScriptKind::Taproot)).unwrap();
+        let (external, _, script) = descriptors(&taproot);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr("));
+        assert!(!taproot.warnings.contains(&InputWarning::AssumedSegwit));
+        assert!(taproot.preview_address.unwrap().starts_with("tb1p"));
+
+        let legacy = parse_input_with(TPUB, Some(ScriptKind::Legacy)).unwrap();
+        let (external, _, _) = descriptors(&legacy);
+        assert!(external.starts_with("pkh("));
+        let preview = legacy.preview_address.unwrap();
+        assert!(
+            preview.starts_with('m') || preview.starts_with('n'),
+            "{preview}"
+        );
+
+        let nested = parse_input_with(TPUB, Some(ScriptKind::NestedSegwit)).unwrap();
+        assert!(nested.preview_address.unwrap().starts_with('2'));
+    }
+
+    #[test]
+    fn choice_is_ignored_for_fixed_inputs() {
+        let single = format!("wpkh({TPUB}/0/*)");
+        let parsed = parse_input_with(&single, Some(ScriptKind::Taproot)).unwrap();
+        let (_, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(parsed.script_options.is_empty());
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
+    }
+
+    #[test]
+    fn multisig_scripts_cannot_be_chosen_for_a_key() {
+        assert!(matches!(
+            parse_input_with(TPUB, Some(ScriptKind::WitnessScript)),
+            Err(CoreError::InvalidInput {
+                kind: "script type",
+                ..
+            })
+        ));
+    }
+
+    /// A SLIP-132 prefix fixes the script: no choice turns a `vpub` into
+    /// a Taproot wallet, and no other script is offered. An origin only
+    /// suggests one. An origin under purpose 48 or 45 is a cosigner's
+    /// key, refused like a cosigner prefix: alone, it watches nothing.
+    #[test]
+    fn a_slip132_prefix_fixes_the_script_and_a_cosigner_origin_is_refused() {
+        let vpub = slip132(TPUB, VPUB);
+        let parsed = parse_input_with(&vpub, Some(ScriptKind::Taproot)).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh("), "{external}");
+        assert!(parsed.script_options.is_empty());
+
+        let origin = format!("[9a6a2580/84'/1'/0']{TPUB}");
+        assert_eq!(
+            parse_input(&origin).unwrap().script_options,
+            SINGLE_KEY_SCRIPTS.to_vec()
+        );
+
+        for purpose in ["48'", "48h", "45'"] {
+            let cosigner = format!("[9a6a2580/{purpose}/1'/0'/2']{TPUB}");
+            let error = parse_input(&cosigner).unwrap_err().to_string();
+            assert!(error.contains("cosigner"), "{purpose}: {error}");
+        }
+    }
+
+    #[test]
+    fn key_origin_sets_the_script_type() {
+        let input = format!("[9a6a2580/86'/1'/0']{TPUB}");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::ExtendedKey);
+        assert!(parsed.warnings.is_empty());
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr([9a6a2580/86'/1'/0']"));
+        assert!(internal.unwrap().contains("/1/*"));
+
+        let hardened_h = format!("[9a6a2580/49h/1h/0h]{TPUB}");
+        let (_, _, script) = descriptors(&parse_input(&hardened_h).unwrap());
+        assert_eq!(script, ScriptKind::NestedSegwit);
+
+        let unknown_purpose = format!("[9a6a2580/0'/1'/0']{TPUB}");
+        let parsed = parse_input(&unknown_purpose).unwrap();
+        assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+    }
+
+    /// Sparrow's descriptor file: comments, then the wallet three times,
+    /// as one multipath descriptor and as its two branches. It reads as
+    /// the multipath one, and only while the three agree.
+    #[test]
+    fn a_sparrow_descriptor_file_reads_as_its_wallet() {
+        let alone = parse_input(MULTIPATH).unwrap();
+        let (receive, change, _) = descriptors(&alone);
+        let whole: Descriptor<DescriptorPublicKey> = MULTIPATH.parse().unwrap();
+        let file = |receive: &str, change: &str| {
+            format!(
+                "# Receive and change descriptor:
+{whole}
+
+# Receive descriptor:
+{receive}
+
+                 # Change descriptor:
+{change}
+"
+            )
+        };
+        let change = change.unwrap();
+        let parsed = parse_input(&file(receive, change)).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        assert_eq!(parsed.payload, alone.payload);
+        assert_eq!(parsed.preview_address, alone.preview_address);
+        let swapped = parse_input(&file(change, receive)).unwrap();
+        assert_eq!(
+            swapped.payload, alone.payload,
+            "the branches in either order"
+        );
+
+        let elsewhere = format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/2/*)");
+        let error = parse_input(&file(receive, &elsewhere))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("same wallet"), "{error}");
+        let error = parse_input(&file(receive, receive))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("the same"), "{error}");
+    }
+
+    /// A payment URI scanned from another wallet's receive screen is its
+    /// address, whatever it asks for and in whichever case it comes.
+    #[test]
+    fn a_payment_uri_reads_as_its_address() {
+        let address = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+        let alone = parse_input(address).unwrap();
+        for uri in [
+            format!("bitcoin:{address}"),
+            format!("bitcoin:{address}?amount=0.001&label=Rent"),
+            format!("BITCOIN:{}?AMOUNT=0.001", address.to_uppercase()),
+        ] {
+            let parsed = parse_input(&uri).unwrap();
+            assert_eq!(parsed.kind, RecognizedKind::Address, "{uri}");
+            assert_eq!(parsed.payload, alone.payload, "{uri}");
+        }
+        assert!(parse_input("bitcoin:").is_err());
+        assert!(parse_input("bitcoin:?amount=1").is_err());
+    }
+
+    #[test]
+    fn bsms_record_is_checked_against_its_first_address() {
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        // Derive the truth once through the classifier itself.
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let first = truth.preview_address.clone().unwrap();
+
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{first}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(external.contains("/0/*") && internal.unwrap().contains("/1/*"));
+        assert_eq!(parsed.preview_address.as_deref(), Some(first.as_str()));
+
+        let tampered = format!(
+            "BSMS 1.0\n{template}\n/0/*,/1/*\ntb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\n"
+        );
+        let error = parse_input(&tampered).unwrap_err().to_string();
+        assert!(error.contains("first address"), "{error}");
+
+        let private = format!("BSMS 1.0\nwsh(pk({TPRV}/**))\n/0/*,/1/*\n{first}\n");
+        assert!(matches!(
+            parse_input(&private),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    /// The address in a record says which network it is for, regtest
+    /// included, and a record that comes in a QR envelope is checked as
+    /// one pasted bare.
+    #[test]
+    fn a_bsms_record_names_its_network_and_opens_from_an_envelope() {
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let regtest = first_address(&truth.payload, Network::Regtest).unwrap();
+        assert!(regtest.starts_with("bcrt1"), "{regtest}");
+
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{regtest}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        assert_eq!(parsed.networks, vec![Network::Regtest]);
+        assert_eq!(parsed.preview_address.as_deref(), Some(regtest.as_str()));
+
+        let signet = truth.preview_address.clone().unwrap();
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{signet}\n");
+        let parsed = parse_input(&record).unwrap();
+        assert!(!parsed.networks.contains(&Network::Regtest));
+        assert!(parsed.networks.contains(&Network::Signet));
+
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02X}")).collect() };
+        let parsed = parse_input(&format!("B$HU0100{}", hex(&record))).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Bsms);
+        let tampered = record.replace(&signet, "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx");
+        let error = parse_input(&format!("B$HU0100{}", hex(&tampered)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("first address"), "{error}");
+    }
+
+    #[test]
+    fn sorted_multisig_is_a_witness_script() {
+        let input = format!("wsh(sortedmulti(1,{TPUB}/<0;1>/*,{TPUB}/<2;3>/*))");
+        let parsed = parse_input(&input).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::MultipathDescriptor);
+        let (_, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::WitnessScript);
+        assert!(parsed.preview_address.unwrap().starts_with("tb1q"));
+    }
+
+    #[test]
+    fn address_has_no_preview() {
+        let parsed = parse_input("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert!(parsed.preview_address.is_none());
+        assert!(parsed.script_options.is_empty());
+    }
+
+    #[test]
+    fn mainnet_bech32_address() {
+        let parsed = parse_input("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::Address);
+        assert_eq!(parsed.networks, vec![Network::Mainnet]);
+    }
+
+    #[test]
+    fn testnet_bech32_address_is_ambiguous() {
+        let parsed = parse_input("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").unwrap();
+        assert_eq!(parsed.networks, vec![Network::Signet, Network::Testnet4]);
+    }
+
+    #[test]
+    fn legacy_addresses() {
+        let mainnet = parse_input("1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2").unwrap();
+        assert_eq!(mainnet.networks, vec![Network::Mainnet]);
+        let testnet = parse_input("mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn").unwrap();
+        assert!(testnet.networks.contains(&Network::Testnet4));
+        assert!(!testnet.networks.contains(&Network::Mainnet));
+    }
+
+    #[test]
+    fn uppercase_bech32_is_canonicalized() {
+        let parsed = parse_input("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4").unwrap();
+        match parsed.payload {
+            ParsedPayload::Address { address } => {
+                assert_eq!(address, "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4");
+            }
+            other => panic!("expected address, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn descriptor_with_tprv_is_rejected_as_private() {
+        let input = format!("wpkh({TPRV}/84'/1'/0'/0/*)");
+        assert!(matches!(
+            parse_input(&input),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    #[test]
+    fn wif_is_rejected_as_private() {
+        assert!(matches!(
+            parse_input("5HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ"),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    #[test]
+    fn seed_phrase_is_rejected_as_private() {
+        let phrase = "abandon abandon abandon abandon abandon abandon \
+                      abandon abandon abandon abandon abandon about";
+        assert!(matches!(
+            parse_input(phrase),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    /// A private key written with JSON escapes reads as nothing in the
+    /// raw text: it is caught once the text is decoded, before anything
+    /// could quote it back in an error.
+    #[test]
+    fn an_escaped_private_key_in_json_is_rejected() {
+        // `\u0035` is the `5` the key starts with.
+        let escaped =
+            r#"{"descriptor": "wpkh(\u0035HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ)"}"#;
+        assert!(matches!(
+            parse_input(escaped),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+        let named = r#"{"bip84": {"\u0035HueCGU8rMjxEXxiPuD5BDku4MkFqeZyd4dZ1jvhTVqvbTLvyTJ": 1}}"#;
+        assert!(matches!(
+            parse_input(named),
+            Err(CoreError::PrivateMaterialRejected)
+        ));
+    }
+
+    #[test]
+    fn json_descriptor_export() {
+        let json = format!("{{\"descriptor\": \"wpkh({TPUB}/0/*)\"}}");
+        let parsed = parse_input(&json).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::WalletExport);
+    }
+
+    #[test]
+    fn coldcard_style_export() {
+        let json = format!(
+            "{{\"xfp\": \"0F056943\", \"bip84\": {{\"xpub\": \"{TPUB}\", \
+             \"deriv\": \"m/84'/1'/0'\", \"name\": \"p2wpkh\"}}}}"
+        );
+        let parsed = parse_input(&json).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::WalletExport);
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.contains("[0f056943/84'/1'/0']"));
+    }
+
+    /// A wallet export whose origin does not read is refused naming what
+    /// it read: the file is out of sight, unlike a field of the app.
+    #[test]
+    fn an_export_origin_that_does_not_read_is_quoted() {
+        let json = format!(
+            "{{\"xfp\": \"0F05694\", \"bip84\": {{\"xpub\": \"{TPUB}\", \
+             \"deriv\": \"m/84'/1'/0'\", \"name\": \"p2wpkh\"}}}}"
+        );
+        let error = parse_input(&json).unwrap_err().to_string();
+        assert!(error.contains("`[0F05694/84'/1'/0']`"), "{error}");
+        assert!(error.contains("not `0F05694`"), "{error}");
+    }
+
+    /// A Coldcard export gives each account the fingerprint of the
+    /// account key itself; the master fingerprint, the one a signer
+    /// knows the wallet by, is the file's, and the one in the account's
+    /// own descriptor. The address the device showed must be the one
+    /// the key derives.
+    #[test]
+    fn a_coldcard_account_carries_the_master_fingerprint() {
+        let account = |extra: &str| {
+            format!(
+                "{{\"chain\": \"XTN\", \"xfp\": \"0F056943\", \"bip84\": {{\"name\": \"p2wpkh\", \
+                 \"xfp\": \"DEADBEEF\", \"deriv\": \"m/84h/1h/0h\", \"xpub\": \"{TPUB}\"{extra}}}}}"
+            )
+        };
+        // Through the account's descriptor, both branches.
+        let desc = format!(
+            ", \"desc\": \"wpkh([0f056943/84h/1h/0h]{TPUB}/<0;1>/*)\", \"first\": \"{DEFAULT_PREVIEW}\""
+        );
+        let parsed = parse_input(&account(&desc)).unwrap();
+        assert_eq!(parsed.kind, RecognizedKind::WalletExport);
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(
+            external.starts_with("wpkh([0f056943/84'/1'/0']tpub"),
+            "{external}"
+        );
+        assert!(internal.unwrap().contains("/1/*"));
+        assert!(!external.contains("deadbeef"));
+
+        // Without one, the key under the file's fingerprint.
+        let parsed = parse_input(&account(&format!(", \"first\": \"{DEFAULT_PREVIEW}\""))).unwrap();
+        let (external, _, _) = descriptors(&parsed);
+        assert!(
+            external.starts_with("wpkh([0f056943/84'/1'/0']tpub"),
+            "{external}"
+        );
+
+        // An address the key does not derive: the file was altered.
+        let altered = account(", \"first\": \"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\"");
+        let error = parse_input(&altered).unwrap_err().to_string();
+        assert!(error.contains("first address"), "{error}");
+
+        // A descriptor for another script than the account's.
+        let other = format!(", \"desc\": \"pkh([0f056943/84h/1h/0h]{TPUB}/<0;1>/*)\"");
+        let error = parse_input(&account(&other)).unwrap_err().to_string();
+        assert!(error.contains("another script type"), "{error}");
+    }
+
+    /// A hardened step after an extended key, or a hardened wildcard,
+    /// asks a public key for a child only the private key can derive,
+    /// and miniscript panics when asked for its address. Every way a
+    /// descriptor comes in refuses it first, and says where those
+    /// steps belong.
+    #[test]
+    fn a_hardened_step_after_an_extended_key_is_refused_wherever_it_comes_from() {
+        let refused = |input: &str| {
+            let error = parse_input(input).unwrap_err();
+            let text = error.to_string();
+            assert!(
+                matches!(
+                    error,
+                    CoreError::InvalidInput {
+                        kind: "descriptor",
+                        ..
+                    }
+                ),
+                "{input}: {text}"
+            );
+            assert!(text.contains("key origin"), "{input}: {text}");
+        };
+        let stepped = format!("wpkh({TPUB}/84h/0/*)");
+        let wildcard = format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/0/*h)");
+
+        // Pasted, with or without its checksum.
+        refused(&stepped);
+        refused(&wildcard);
+        refused(&format!("{stepped}#{}", desc_checksum(&stepped).unwrap()));
+        refused(&format!("wpkh({})", slip132(TPUB, VPUB) + "/0'/0/*"));
+        // As one multipath descriptor, and on the second key of a
+        // multisig.
+        refused(&format!("wpkh({TPUB}/1'/<0;1>/*)"));
+        refused(&format!("wsh(sortedmulti(1,{TPUB}/0/*,{TPUB}/0h/*))"));
+        // As a pair on two lines, the hardened one first or second.
+        refused(&format!("wpkh({TPUB}/0/*)\nwpkh({TPUB}/1h/*)"));
+        refused(&format!("wpkh({TPUB}/0h/*)\nwpkh({TPUB}/1/*)"));
+        // As a Sparrow descriptor file.
+        refused(&format!(
+            "wpkh({TPUB}/7h/<0;1>/*)\nwpkh({TPUB}/7h/0/*)\nwpkh({TPUB}/7h/1/*)"
+        ));
+        // In a JSON export, generic or Coldcard.
+        refused(&serde_json::json!({ "descriptor": stepped }).to_string());
+        refused(
+            &serde_json::json!({ "descriptor": format!("wpkh({TPUB}/0/*)"), "change_descriptor": wildcard })
+                .to_string(),
+        );
+        refused(&serde_json::json!({ "bip84": { "desc": stepped } }).to_string());
+        // In a QR envelope.
+        let hex = |text: &str| -> String { text.bytes().map(|b| format!("{b:02X}")).collect() };
+        refused(&format!("B$HU0100{}", hex(&stepped)));
+        // In a BSMS record, bare or in an envelope.
+        let record = format!(
+            "BSMS 1.0\nwsh(sortedmulti(1,{TPUB}/**,{TPUB}/0h/**))\n/0/*,/1/*\n\
+             tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx\n"
+        );
+        refused(&record);
+        refused(&format!("B$HU0100{}", hex(&record)));
+
+        // The same keys, the hardened steps in their origin, are fine.
+        let parsed = parse_input(&format!("wpkh([9a6a2580/84'/1'/0']{TPUB}/0/*)")).unwrap();
+        assert!(parsed.preview_address.is_some());
+    }
+
+    /// Text nested past any real wallet is refused before miniscript,
+    /// which reads and walks a descriptor recursively, gets to recurse
+    /// over it; the depth of a real one is far from the limit.
+    #[test]
+    fn a_descriptor_nested_past_reason_is_refused_unparsed() {
+        // A key of its own at each level: miniscript refuses one
+        // repeated.
+        let key = |level: usize| format!("{TPUB}/{level}/*");
+        let nested = |levels: usize| {
+            let branches: String = (0..levels)
+                .map(|l| format!("or_i(pk({}),", key(l)))
+                .collect();
+            format!("wsh({branches}pk({}){})", key(levels), ")".repeat(levels))
+        };
+        assert!(parse_input(&nested(3)).is_ok());
+        // Just past the limit, and as deep as the input cap lets a
+        // pasted text go.
+        for levels in [MAX_DESCRIPTOR_DEPTH - 1, 400] {
+            let error = parse_input(&nested(levels)).unwrap_err().to_string();
+            assert!(error.contains("nests deeper"), "{levels}: {error}");
+        }
+        let leaves: String = (1..=150).map(|l| format!("{{pk({}),", key(l))).collect();
+        let tree = format!("tr({},{leaves}pk({}){})", key(0), key(151), "}".repeat(150));
+        let error = parse_input(&tree).unwrap_err().to_string();
+        assert!(error.contains("nests deeper"), "{error}");
+        // Past any cap on the input, still no stack to overflow.
+        let error = read_descriptor(&"sh(".repeat(1_000_000))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nests deeper"), "{error}");
+    }
+
+    #[test]
+    fn garbage_is_unrecognized() {
+        assert!(matches!(
+            parse_input("hello world, this is not wallet material at all"),
+            Err(CoreError::UnrecognizedInput(_))
+        ));
+        assert!(matches!(
+            parse_input(""),
+            Err(CoreError::UnrecognizedInput(_))
+        ));
+    }
+
+    #[test]
+    fn txid_like_hex_is_unrecognized() {
+        assert!(matches!(
+            parse_input("4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"),
+            Err(CoreError::UnrecognizedInput(_))
+        ));
+    }
+
+    #[test]
+    fn default_derivation_matches_the_plain_import() {
+        let parsed = parse_input_with_options(TPUB, &ImportOptions::default()).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert_eq!(internal.unwrap(), format!("wpkh({TPUB}/1/*)#u0jxnq94"));
+        assert!(parsed.derivation_editable);
+        assert_eq!(parsed.derivation, Some(DerivationChoice::default()));
+        assert!(
+            !parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert_eq!(parsed.preview_address.as_deref(), Some(DEFAULT_PREVIEW));
+    }
+
+    #[test]
+    fn key_origin_fills_the_derivation() {
+        let parsed = parse_input(&format!("[9a6a2580/84h/1h/0h]{TPUB}")).unwrap();
+        assert!(parsed.derivation_editable);
+        assert!(parsed.warnings.is_empty());
+        let derivation = parsed.derivation.as_ref().unwrap();
+        assert_eq!(derivation.origin.as_deref(), Some("[9a6a2580/84'/1'/0']"));
+        assert_eq!(derivation.receive, "0/*");
+        assert_eq!(derivation.change.as_deref(), Some("1/*"));
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([9a6a2580/84'/1'/0']"));
+    }
+
+    #[test]
+    fn untracked_change_is_a_single_descriptor() {
+        let options = with_derivation("0/*", None, None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert_eq!(external, format!("wpkh({TPUB}/0/*)#dmh8w44d"));
+        assert!(internal.is_none());
+        assert!(parsed.warnings.contains(&InputWarning::ChangeNotTracked));
+        assert!(
+            parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert_eq!(parsed.derivation.unwrap().change, None);
+    }
+
+    #[test]
+    fn custom_branches_rebuild_both_descriptors() {
+        let options = with_derivation("5/*", Some("6/*"), None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, internal, _) = descriptors(&parsed);
+        assert!(external.contains(&format!("{TPUB}/5/*")), "{external}");
+        assert!(internal.unwrap().contains(&format!("{TPUB}/6/*")));
+        assert!(
+            parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+        assert!(!parsed.warnings.contains(&InputWarning::ChangeNotTracked));
+        let preview = parsed.preview_address.unwrap();
+        assert!(preview.starts_with("tb1q"), "{preview}");
+        assert_ne!(preview, DEFAULT_PREVIEW);
+    }
+
+    #[test]
+    fn branches_are_canonicalized() {
+        let options = with_derivation(" 007/* ", Some("/*"), None);
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let derivation = parsed.derivation.as_ref().unwrap();
+        assert_eq!(derivation.receive, "7/*");
+        assert_eq!(derivation.change.as_deref(), Some("*"));
+        let (external, internal, _) = descriptors(&parsed);
+        assert!(external.contains(&format!("{TPUB}/7/*")));
+        assert!(internal.unwrap().contains(&format!("{TPUB}/*)")));
+    }
+
+    #[test]
+    fn bad_branches_are_refused_as_derivation_paths() {
+        let rejected = |receive: &str, change: Option<&str>| {
+            let options = with_derivation(receive, change, None);
+            match parse_input_with_options(TPUB, &options) {
+                Err(CoreError::InvalidInput {
+                    kind: "derivation path",
+                    detail,
+                }) => detail,
+                other => panic!("{receive:?}/{change:?} should be refused, got {other:?}"),
+            }
+        };
+        assert!(rejected("0'/*", Some("1/*")).contains("hardened"));
+        assert!(rejected("0h/*", Some("1/*")).contains("hardened"));
+        assert!(rejected("0/*", Some("1H/*")).contains("hardened"));
+        assert!(rejected("0", Some("1/*")).contains('*'));
+        assert!(rejected("0*", Some("1/*")).contains("/*"));
+        assert!(rejected("0/*", Some("0/*")).contains("both"));
+        assert!(rejected("", Some("1/*")).contains("empty"));
+        assert!(rejected("0//*", Some("1/*")).contains("empty step"));
+        assert!(rejected("a/*", Some("1/*")).contains("not a number"));
+        assert!(rejected("2147483648/*", Some("1/*")).contains("above"));
+        assert!(rejected("*/0/*", Some("1/*")).contains("last"));
+    }
+
+    /// A pair whose policy does not lift, here a height and a time lock
+    /// on one path, which only a permissive reading lets through: the
+    /// two-line import refuses it as unreadable, a stored pair goes
+    /// through, since nothing in it proves two wallets; a stored pair
+    /// that does prove it is still refused.
+    #[test]
+    fn a_stored_pair_is_refused_only_on_proof() {
+        use bdk_wallet::miniscript::{ExtParams, Miniscript, Segwitv0};
+        let read = |branch: u32, key: &str| {
+            let ms = Miniscript::<DescriptorPublicKey, Segwitv0>::from_str_ext(
+                &format!("and_v(v:pk({key}/{branch}/*),and_v(v:after(100),after(500000001)))"),
+                &ExtParams::allow_all(),
+            )
+            .unwrap();
+            Descriptor::new_wsh(ms).unwrap()
+        };
+        let (receive, change) = (read(0, TPUB), read(1, TPUB));
+        assert!(crate::wallet::policy::policy_by_material(&receive).is_err());
+        assert!(check_pair(&receive, &change).is_err());
+        check_stored_pair(&receive, &change).unwrap();
+
+        let receive = read_descriptor(&format!("wpkh({XPUB}/0/*)")).unwrap();
+        let change = read_descriptor(&format!("wpkh({XPUB_B}/1/*)")).unwrap();
+        assert!(check_stored_pair(&receive, &change).is_err());
+
+        // A raw hash does not lift. Swapped in on one branch only, beside
+        // another key, it is another wallet; on both branches, around the
+        // same keys, it is one.
+        const HASH: &str = "1234567890123456789012345678901234567890";
+        let raw = |key: &str, branch: u32| {
+            read_descriptor(&format!(
+                "wsh(or_d(pk({key}/{branch}/*),c:expr_raw_pkh({HASH})))"
+            ))
+            .unwrap()
+        };
+        let multi = read_descriptor(&format!("wsh(multi(2,{XPUB}/0/*,{XPUB_B}/0/*))")).unwrap();
+        let refused = check_stored_pair(&multi, &raw(XPUB_C, 1)).unwrap_err();
+        assert!(refused.to_string().contains("another wallet"), "{refused}");
+        assert!(check_stored_pair(&raw(XPUB, 0), &multi).is_err());
+        check_stored_pair(&raw(XPUB, 0), &raw(XPUB, 1)).unwrap();
+        assert!(check_stored_pair(&raw(XPUB, 0), &raw(XPUB_C, 1)).is_err());
+        assert!(check_pair(&raw(XPUB, 0), &raw(XPUB, 1)).is_err());
+    }
+
+    #[test]
+    fn bad_origins_are_refused_as_derivation_paths() {
+        let rejected = |origin: &str| {
+            let options = with_derivation("0/*", Some("1/*"), Some(origin));
+            match parse_input_with_options(TPUB, &options) {
+                Err(CoreError::InvalidInput {
+                    kind: "derivation path",
+                    detail,
+                }) => detail,
+                other => panic!("{origin:?} should be refused, got {other:?}"),
+            }
+        };
+        assert!(rejected("[zz]").contains("fingerprint"));
+        assert!(rejected("[deadbeef0/84']").contains("fingerprint"));
+        assert!(rejected("[deadbeef/84'/*]").contains("wildcard"));
+        assert!(rejected("[deadbeef/84'/x]").contains("not a number"));
+        assert!(rejected("[deadbeef/84'/]").contains("empty step"));
+        assert!(rejected("[deadbeef/84'").contains("brackets"));
+    }
+
+    /// A private key pasted into the receive, change or origin field is
+    /// refused as private material, as in the main field, and no error
+    /// about a path ever quotes a long run of what was typed.
+    #[test]
+    fn derivation_fields_refuse_private_keys_without_quoting_them() {
+        let refused = |options: ImportOptions| {
+            assert!(
+                matches!(
+                    parse_input_with_options(TPUB, &options),
+                    Err(CoreError::PrivateMaterialRejected)
+                ),
+                "{options:?}"
+            );
+        };
+        refused(with_derivation(&format!("{TPRV}/*"), Some("1/*"), None));
+        refused(with_derivation("0/*", Some(TPRV), None));
+        refused(with_derivation(
+            "0/*",
+            Some("1/*"),
+            Some(&format!("[deadbeef]{TPRV}")),
+        ));
+
+        let long = "a".repeat(64);
+        for options in [
+            with_derivation(&format!("{long}/*"), Some("1/*"), None),
+            with_derivation("0/*", Some(&long), None),
+            with_derivation("0/*", Some("1/*"), Some(&long)),
+            with_derivation("0/*", Some("1/*"), Some(&format!("[deadbeef/{long}]"))),
+        ] {
+            let error = parse_input_with_options(TPUB, &options).unwrap_err();
+            assert!(!error.to_string().contains(&long), "{error}");
+        }
+        let short = with_derivation("0/x1/*", Some("1/*"), None);
+        let error = parse_input_with_options(TPUB, &short).unwrap_err();
+        assert!(error.to_string().contains("(`x1`)"), "{error}");
+    }
+
+    #[test]
+    fn chosen_origin_overrides_the_input() {
+        let options = with_derivation("0/*", Some("1/*"), Some("[DEADBEEF/84h/0h/0h]"));
+        let parsed = parse_input_with_options(XPUB, &options).unwrap();
+        let (external, internal, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Segwit);
+        assert!(external.starts_with("wpkh([deadbeef/84'/0'/0']xpub"));
+        assert!(
+            internal
+                .unwrap()
+                .starts_with("wpkh([deadbeef/84'/0'/0']xpub")
+        );
+        assert!(!parsed.warnings.contains(&InputWarning::AssumedSegwit));
+        assert_eq!(parsed.networks, vec![Network::Mainnet]);
+        assert_eq!(
+            parsed.derivation.unwrap().origin.as_deref(),
+            Some("[deadbeef/84'/0'/0']")
+        );
+
+        let input = format!("[9a6a2580/86'/1'/0']{TPUB}");
+        let options = with_derivation("0/*", Some("1/*"), Some("[deadbeef/44'/1'/0']"));
+        let parsed = parse_input_with_options(&input, &options).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Legacy);
+        assert!(external.starts_with("pkh([deadbeef/44'/1'/0']"));
+
+        // A blank choice keeps the input's origin.
+        let options = with_derivation("0/*", Some("1/*"), Some(" "));
+        let parsed = parse_input_with_options(&input, &options).unwrap();
+        assert_eq!(
+            parsed.derivation.unwrap().origin.as_deref(),
+            Some("[9a6a2580/86'/1'/0']")
+        );
+    }
+
+    #[test]
+    fn fingerprint_only_origin_is_accepted() {
+        let options = with_derivation("0/*", Some("1/*"), Some("deadbeef"));
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        assert_eq!(
+            parsed.derivation.as_ref().unwrap().origin.as_deref(),
+            Some("[deadbeef]")
+        );
+        assert!(parsed.warnings.contains(&InputWarning::AssumedSegwit));
+        let (external, _, _) = descriptors(&parsed);
+        assert!(external.starts_with("wpkh([deadbeef]tpub"));
+    }
+
+    #[test]
+    fn explicit_script_wins_over_the_chosen_origin() {
+        let options = ImportOptions {
+            script: Some(ScriptKind::Taproot),
+            derivation: Some(DerivationChoice {
+                origin: Some("[deadbeef/84'/1'/0']".to_owned()),
+                ..DerivationChoice::default()
+            }),
+            network: None,
+        };
+        let parsed = parse_input_with_options(TPUB, &options).unwrap();
+        let (external, _, script) = descriptors(&parsed);
+        assert_eq!(script, ScriptKind::Taproot);
+        assert!(external.starts_with("tr([deadbeef/84'/1'/0']"));
+        assert!(
+            !parsed
+                .warnings
+                .contains(&InputWarning::NonStandardDerivation)
+        );
+    }
+
+    #[test]
+    fn fixed_inputs_ignore_the_derivation() {
+        let options = with_derivation("5/*", None, Some("[deadbeef]"));
+
+        let single = format!("wpkh({TPUB}/0/*)");
+        let parsed = parse_input_with_options(&single, &options).unwrap();
+        assert!(!parsed.derivation_editable);
+        assert!(parsed.derivation.is_none());
+        let (external, _, _) = descriptors(&parsed);
+        assert!(external.contains("/0/*") && !external.contains("deadbeef"));
+
+        let address =
+            parse_input_with_options("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4", &options)
+                .unwrap();
+        assert!(!address.derivation_editable && address.derivation.is_none());
+
+        let template = format!(
+            "wsh(sortedmulti(1,[9a6a2580/48'/1'/0'/2']{TPUB}/**,[00000000/48'/1'/0'/2']{TPUB}/**))"
+        );
+        let truth = parse_input(&template.replace("/**", "/<0;1>/*")).unwrap();
+        let first = truth.preview_address.unwrap();
+        let record = format!("BSMS 1.0\n{template}\n/0/*,/1/*\n{first}\n");
+        let bsms = parse_input_with_options(&record, &options).unwrap();
+        assert_eq!(bsms.kind, RecognizedKind::Bsms);
+        assert!(!bsms.derivation_editable && bsms.derivation.is_none());
+    }
+
+    #[test]
+    fn parsed_input_without_derivation_fields_still_loads() {
+        let json = format!(
+            "{{\"kind\":\"extended_key\",\"networks\":[\"signet\"],\"payload\":{{\"type\":\
+             \"descriptors\",\"external\":\"wpkh({TPUB}/0/*)\",\"internal\":null,\
+             \"script\":\"segwit\"}},\"warnings\":[\"assumed_segwit\"]}}"
+        );
+        let parsed: ParsedInput = serde_json::from_str(&json).unwrap();
+        assert!(parsed.derivation.is_none());
+        assert!(!parsed.derivation_editable);
+
+        let options = with_derivation("5/*", Some("6/*"), Some("[deadbeef/84'/1'/0']"));
+        let original = parse_input_with_options(TPUB, &options).unwrap();
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"non_standard_derivation\""), "{json}");
+        assert!(json.contains("\"derivation_editable\":true"), "{json}");
+        let restored: ParsedInput = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.derivation, original.derivation);
+        assert!(restored.derivation_editable);
+    }
+}
