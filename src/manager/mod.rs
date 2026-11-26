@@ -156,10 +156,9 @@ pub struct Shared {
     /// The test of a backend under way for each network: see
     /// [`WalletManager::check_backend`].
     pub(crate) backend_checks: std::sync::Mutex<settings::BackendChecks>,
-    /// The last quotes and the failing sources: see
-    /// [`WalletManager::fetch_price`]. Held across the request, so asks
-    /// that come together share one.
-    pub(crate) prices: Mutex<price::PriceDesk>,
+    /// The last quotes and the failing sources, and the turn of the
+    /// price request under way: see [`WalletManager::fetch_price`].
+    pub(crate) prices: price::PriceDesk,
 }
 
 /// The last sync of a wallet to finish, when it started and how far it
@@ -206,7 +205,7 @@ impl WalletManager {
                 complete_here: std::sync::Mutex::new(HashSet::new()),
                 relegated: std::sync::Mutex::new(sync::Relegations::default()),
                 backend_checks: std::sync::Mutex::new(settings::BackendChecks::default()),
-                prices: Mutex::new(price::PriceDesk::default()),
+                prices: price::PriceDesk::default(),
             }),
         })
     }

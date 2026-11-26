@@ -17,6 +17,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A backup carries the icon chosen for each wallet, and a restore gives it back. A wallet left on the plain icon writes nothing, so earlier builds still read the backup, and restore the plain wallet.
 - `UtxoInfo` carries `confirmations`, counted as for a transaction: 0 while the output waits, 1 once it is in the tip block. An app can show how deep a coin is without working it out of the block height.
 - `Settings.retired_servers` names, by network, the public server a person chose that this build no longer offers, such as `{"mainnet": "frigate.2140.dev"}`. Syncs on that network still spread across the public servers until another is chosen, and the settings can now say so.
+- `retry_price` is the "Try again" of the settings: it asks the price source at once, unless the source asked for the wait itself with a rate limit.
+- `PriceTable.keep_secs` says how long the last quote stands in for the price while its source fails: 6 hours.
+
+### Changed
+
+- `fetch_price` answers a `PriceReading` instead of a quote. It is `fresh` with the quote the source just gave, `kept` with the last quote and the `PriceTrouble` that stopped a new one, or `missing` with the trouble alone. A `PriceTrouble` names its `kind` (`rate_limited`, `unreachable`, `refused` or `tor`), when it began, when the source is asked again, and whether it is `lasting`. It is lasting after a second failure in a row, or at once when Tor is missing.
 
 ### Removed
 
@@ -30,6 +36,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A price source that fails no longer takes the price away. The last quote stays for up to 6 hours, with the time it was given. The source is asked again after 1 minute, then 2, then 4, up to 30 minutes, and never before the `Retry-After` it sends, up to an hour. A quote less than 30 seconds old answers again, and asks that come together share one request, so the apps never send a burst. It used to answer an error at the first failed request.
+- A price chart no longer waits on a price request under way. The mempool.space chart ends on the last quote kept instead of sending a request of its own.
 - An Electrum server that answers in the clear on a port saved with TLS makes a sync fail with "the server answered without TLS. This port may not use TLS: use the server's TLS port, or turn TLS off if it has none". It used to fail with the TLS library's own words, "received corrupt message of type InvalidContentType".
 - A wallet removed from the device takes with it everything the core kept that names it. Besides its record and what was announced of it, the transactions this app broadcast that touch it go, even one that also touches another wallet: one that pays or spends one of its addresses, or that its history holds. The app preferences lose its identifier, and the session forgets what it proved of its addresses and what the live watch heard of them. A spend of the same key or witness script nested in P2SH (`sh(wpkh)`, `sh(wsh)`) belongs to another wallet, and stays.
 - `WalletManager::notices` and `notices_of` say nothing of a wallet removed since its news was claimed, and count nothing for it. A transaction an app still held for it used to be posted after the removal, under the app's name and with its amount. Both are now `async`: they read the vault.

@@ -9,18 +9,43 @@ use crate::price::{
 
 use super::WalletManager;
 
-/// What the manager keeps of the price: the last quotes and the holds
-/// of failing sources ([`PriceKeeper`]), and where the sources answer.
+/// What the manager keeps of the price.
 #[derive(Debug, Default)]
 pub(crate) struct PriceDesk {
+    /// The last quotes and the holds of failing sources, and where the
+    /// sources answer. Held for a few instructions, never across an
+    /// await: a chart never waits on a price request under way.
+    books: std::sync::Mutex<Books>,
+    /// Held by the one price request under way, across it: asks that
+    /// come together wait for it, then read what it brought.
+    asking: tokio::sync::Mutex<()>,
+}
+
+#[derive(Debug, Default)]
+struct Books {
     keeper: PriceKeeper,
-    pub(crate) endpoints: Endpoints,
+    endpoints: Endpoints,
+}
+
+impl PriceDesk {
+    fn books(&self) -> std::sync::MutexGuard<'_, Books> {
+        self.books
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[cfg(test)]
 impl PriceDesk {
-    pub(crate) fn age_by(&mut self, secs: u64) {
-        self.keeper.age_by(secs);
+    /// Puts a source of the test's own in place of a public one.
+    pub(crate) fn point(&self, change: impl FnOnce(&mut Endpoints)) {
+        change(&mut self.books().endpoints);
+    }
+
+    /// The clock moving on for the quotes kept: see
+    /// [`PriceKeeper::age_by`].
+    pub(crate) fn age_by(&self, secs: u64) {
+        self.books().keeper.age_by(secs);
     }
 }
 
@@ -55,20 +80,26 @@ impl WalletManager {
     }
 
     async fn read_price(&self, forced: bool) -> CoreResult<PriceReading> {
+        let _turn = self.prices.asking.lock().await;
+        // Read once the turn is ours: an ask that waited on another
+        // prices what the preferences say now, not what they said when
+        // it began to wait.
         let preferences = self.preferences().await;
         let (source, currency) = (preferences.price_source, preferences.fiat_currency);
         price::check_quote(source, currency)?;
-        let mut desk = self.prices.lock().await;
-        if let Some(reading) =
-            desk.keeper
-                .answer_without_asking(source, currency, now_secs(), forced)
-        {
-            return Ok(reading);
-        }
-        let asked = match self.beside_syncs_proxy().await {
-            Ok(proxy) => {
-                price::fetch_price(source, currency, proxy.as_deref(), &desk.endpoints).await
+        let endpoints = {
+            let books = self.prices.books();
+            if let Some(reading) =
+                books
+                    .keeper
+                    .answer_without_asking(source, currency, now_secs(), forced)
+            {
+                return Ok(reading);
             }
+            books.endpoints.clone()
+        };
+        let asked = match self.beside_syncs_proxy().await {
+            Ok(proxy) => price::fetch_price(source, currency, proxy.as_deref(), &endpoints).await,
             Err(CoreError::Tor(detail)) => Err(Failure {
                 kind: TroubleKind::Tor,
                 retry_after: None,
@@ -76,9 +107,10 @@ impl WalletManager {
             }),
             Err(other) => return Err(other),
         };
+        let mut books = self.prices.books();
         Ok(match asked {
-            Ok(quote) => desk.keeper.answered(quote),
-            Err(failure) => desk.keeper.failed(source, currency, &failure, now_secs()),
+            Ok(quote) => books.keeper.answered(quote),
+            Err(failure) => books.keeper.failed(source, currency, &failure, now_secs()),
         })
     }
 
@@ -87,26 +119,43 @@ impl WalletManager {
     /// serve is refused first, with nothing resolved and nothing sent;
     /// so is a series from a source that asked to be left alone, until
     /// its wait is over. A rate limit met here holds the price too.
+    ///
+    /// mempool.space's hourly series is closed by the last quote the
+    /// price kept, at its own time, rather than by a request of its own
+    /// that nothing would hold back.
     pub async fn fetch_price_history(&self, range: PriceRange) -> CoreResult<PriceHistory> {
         let preferences = self.preferences().await;
         let (source, currency) = (preferences.price_source, preferences.fiat_currency);
         price::check_history(source, currency, range)?;
-        let endpoints = {
-            let desk = self.prices.lock().await;
-            if let Some(until) = desk.keeper.source_wait(source, now_secs()) {
-                return Err(price::waiting_error(source, until));
+        let (endpoints, closing) = {
+            let books = self.prices.books();
+            let now = now_secs();
+            if let Some(until) = books.keeper.source_wait(source, now) {
+                return Err(price::waiting_error(source, until.saturating_sub(now)));
             }
-            desk.endpoints.clone()
+            (
+                books.endpoints.clone(),
+                books.keeper.latest(source, currency, now),
+            )
         };
         let proxy = self.beside_syncs_proxy().await?;
-        match price::fetch_price_history(source, currency, range, proxy.as_deref(), &endpoints)
-            .await
+        match price::fetch_price_history(
+            source,
+            currency,
+            range,
+            proxy.as_deref(),
+            &endpoints,
+            closing.as_ref(),
+        )
+        .await
         {
             Ok(history) => Ok(history),
             Err(failure) => {
                 if failure.kind == TroubleKind::RateLimited {
-                    let mut desk = self.prices.lock().await;
-                    desk.keeper.hold_source(source, &failure, now_secs());
+                    self.prices
+                        .books()
+                        .keeper
+                        .note_wait(source, &failure, now_secs());
                 }
                 Err(failure.into())
             }

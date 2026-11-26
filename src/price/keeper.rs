@@ -39,6 +39,13 @@ const FAILURES_TO_SAY: u32 = 2;
 /// seconds, never cost two requests.
 const REUSE_SECS: u64 = 30;
 
+/// The longest hold the keeper ever sets.
+const LONGEST_WAIT_SECS: u64 = if MAX_RETRY_AFTER_SECS > MAX_BACKOFF_SECS {
+    MAX_RETRY_AFTER_SECS
+} else {
+    MAX_BACKOFF_SECS
+};
+
 /// The price as the screens should show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -147,6 +154,29 @@ impl PriceKeeper {
             .map(|(_, hold)| hold)
     }
 
+    /// The hold of `source` as it stands at `now`. One that ends further
+    /// off than any wait the keeper sets was set before the clock went
+    /// back: it is not followed, or the price would freeze for as long
+    /// as the clock jumped.
+    fn hold_at(&self, source: PriceSource, now: u64) -> Option<&Hold> {
+        self.hold(source)
+            .filter(|hold| hold.next_try <= now.saturating_add(LONGEST_WAIT_SECS))
+    }
+
+    /// The last quote of the pair, while it may still stand in for the
+    /// price: [`KEEP_SECS`] either side of `now`, so a clock that went
+    /// back does not keep a quote for ever.
+    pub fn latest(
+        &self,
+        source: PriceSource,
+        currency: FiatCurrency,
+        now: u64,
+    ) -> Option<PriceQuote> {
+        self.quote(source, currency)
+            .filter(|quote| quote.at.abs_diff(now) <= KEEP_SECS)
+            .cloned()
+    }
+
     /// The reading of a pair under the hold of its source.
     fn reading_under(
         &self,
@@ -161,12 +191,9 @@ impl PriceKeeper {
             next_try: hold.next_try,
             lasting: hold.failures >= FAILURES_TO_SAY || hold.kind == TroubleKind::Tor,
         };
-        match self.quote(source, currency) {
-            Some(quote) if now.saturating_sub(quote.at) <= KEEP_SECS => PriceReading::Kept {
-                quote: quote.clone(),
-                trouble,
-            },
-            _ => PriceReading::Missing { trouble },
+        match self.latest(source, currency, now) {
+            Some(quote) => PriceReading::Kept { quote, trouble },
+            None => PriceReading::Missing { trouble },
         }
     }
 
@@ -180,12 +207,12 @@ impl PriceKeeper {
         now: u64,
         forced: bool,
     ) -> Option<PriceReading> {
-        if let Some(hold) = self.hold(source) {
+        if let Some(hold) = self.hold_at(source, now) {
             let waiting = now < hold.next_try && (!forced || hold.asked_by_source);
             return waiting.then(|| self.reading_under(hold, source, currency, now));
         }
         self.quote(source, currency)
-            .filter(|quote| now.saturating_sub(quote.at) < REUSE_SECS)
+            .filter(|quote| quote.at <= now && now - quote.at < REUSE_SECS)
             .map(|quote| PriceReading::Fresh {
                 quote: quote.clone(),
             })
@@ -214,11 +241,10 @@ impl PriceKeeper {
         self.reading_under(&hold, source, currency, now)
     }
 
-    /// Records a failure of `source` without a pair to read: what a
-    /// price series that failed tells of its source.
-    pub fn hold_source(&mut self, source: PriceSource, failure: &Failure, now: u64) {
+    /// Records the failure of a price ask of `source`.
+    fn hold_source(&mut self, source: PriceSource, failure: &Failure, now: u64) {
         let (failures, since) = match self.hold(source) {
-            Some(hold) => (hold.failures.saturating_add(1), hold.since),
+            Some(hold) => (hold.failures.saturating_add(1), hold.since.min(now)),
             None => (1, now),
         };
         // Tor is a matter of this machine, which no wait on a source
@@ -227,17 +253,43 @@ impl PriceKeeper {
             TroubleKind::Tor => REFRESH_SECS,
             _ => backoff_secs(failures),
         };
-        let named = failure
-            .retry_after
-            .map(|secs| secs.min(MAX_RETRY_AFTER_SECS));
-        let wait = backoff.max(named.unwrap_or(0));
+        let named = named_wait(failure);
         let hold = Hold {
             failures,
             kind: failure.kind,
             since,
-            next_try: now + wait,
+            next_try: now + backoff.max(named.unwrap_or(0)),
             asked_by_source: failure.kind == TroubleKind::RateLimited || named.is_some(),
         };
+        self.put_hold(source, hold);
+    }
+
+    /// A rate limit met by a price series at `now`: the price waits for
+    /// it too, as long as the source asked, without counting as a failed
+    /// price ask. A chart is no price on screen, and its rate limit does
+    /// not make the price's trouble worth saying any sooner.
+    pub fn note_wait(&mut self, source: PriceSource, failure: &Failure, now: u64) {
+        let until = now + named_wait(failure).unwrap_or(0).max(REFRESH_SECS);
+        let hold = match self.hold_at(source, now) {
+            Some(hold) => Hold {
+                next_try: hold.next_try.max(until),
+                asked_by_source: true,
+                ..hold.clone()
+            },
+            // No failed price ask yet: the next price ask that fails is
+            // the first one, and is quiet.
+            None => Hold {
+                failures: 0,
+                kind: failure.kind,
+                since: now,
+                next_try: until,
+                asked_by_source: true,
+            },
+        };
+        self.put_hold(source, hold);
+    }
+
+    fn put_hold(&mut self, source: PriceSource, hold: Hold) {
         self.holds.retain(|(held, _)| *held != source);
         self.holds.push((source, hold));
     }
@@ -254,10 +306,17 @@ impl PriceKeeper {
     /// When the source asked to be left alone until, if it did and that
     /// time is not past: a price series waits for it too.
     pub fn source_wait(&self, source: PriceSource, now: u64) -> Option<u64> {
-        self.hold(source)
+        self.hold_at(source, now)
             .filter(|hold| hold.asked_by_source && now < hold.next_try)
             .map(|hold| hold.next_try)
     }
+}
+
+/// The wait a failure's source named, within [`MAX_RETRY_AFTER_SECS`].
+fn named_wait(failure: &Failure) -> Option<u64> {
+    failure
+        .retry_after
+        .map(|secs| secs.min(MAX_RETRY_AFTER_SECS))
 }
 
 #[cfg(test)]
@@ -495,6 +554,56 @@ mod tests {
         assert!(matches!(usd, Some(PriceReading::Missing { .. })), "{usd:?}");
         let other = keeper.answer_without_asking(PriceSource::MempoolSpace, EUR, T0 + 61, false);
         assert_eq!(other, None, "the other source is not held");
+    }
+
+    /// A clock set back by a day neither freezes the price on a quote
+    /// "from the future" nor holds the source for the day.
+    #[test]
+    fn a_clock_set_back_freezes_nothing() {
+        let day = 86_400;
+        let mut keeper = PriceKeeper::default();
+        keeper.answered(quote(T0));
+        assert_eq!(
+            keeper.answer_without_asking(CG, EUR, T0 - day, false),
+            None,
+            "a quote from the future is not reused"
+        );
+        assert_eq!(keeper.latest(CG, EUR, T0 - day), None);
+
+        keeper.failed(CG, EUR, &failure(TroubleKind::RateLimited, Some(600)), T0);
+        assert_eq!(keeper.answer_without_asking(CG, EUR, T0 - day, true), None);
+        assert_eq!(keeper.source_wait(CG, T0 - day), None);
+        // Within the hold, it holds.
+        assert!(
+            keeper
+                .answer_without_asking(CG, EUR, T0 + 5, true)
+                .is_some()
+        );
+    }
+
+    /// A rate limit met by a chart holds the price for the wait it
+    /// named, without counting as a failed price ask: the next one that
+    /// fails is still quiet.
+    #[test]
+    fn a_charts_rate_limit_holds_the_price_quietly() {
+        let mut keeper = PriceKeeper::default();
+        keeper.answered(quote(T0));
+        keeper.note_wait(CG, &failure(TroubleKind::RateLimited, Some(300)), T0 + 60);
+        assert_eq!(keeper.source_wait(CG, T0 + 61), Some(T0 + 360));
+        let held = keeper
+            .answer_without_asking(CG, EUR, T0 + 61, true)
+            .expect("held");
+        assert!(!reading_trouble(&held).lasting);
+        assert!(matches!(held, PriceReading::Kept { .. }), "{held:?}");
+
+        let first = keeper.failed(CG, EUR, &failure(TroubleKind::Unreachable, None), T0 + 360);
+        assert!(!reading_trouble(&first).lasting, "the first price failure");
+
+        // A wait shorter than the one in place does not shorten it.
+        let mut keeper = PriceKeeper::default();
+        keeper.failed(CG, EUR, &failure(TroubleKind::RateLimited, Some(600)), T0);
+        keeper.note_wait(CG, &failure(TroubleKind::RateLimited, None), T0 + 10);
+        assert_eq!(keeper.source_wait(CG, T0 + 10), Some(T0 + 600));
     }
 
     fn reading_trouble(reading: &PriceReading) -> &PriceTrouble {

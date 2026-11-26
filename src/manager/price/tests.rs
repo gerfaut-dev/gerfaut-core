@@ -309,14 +309,16 @@ impl FakeSource {
 async fn priced_by(dir: &std::path::Path, source: &FakeSource) -> crate::WalletManager {
     let manager = manager(dir).await;
     price_by(&manager, PriceSource::Coingecko, FiatCurrency::Eur).await;
-    manager.prices.lock().await.endpoints.coingecko = source.base.clone();
+    manager
+        .prices
+        .point(|endpoints| endpoints.coingecko = source.base.clone());
     manager
 }
 
 /// Leaves the reuse window behind: the keeper forgets the time a quote
 /// was asked at by moving it back, which is the clock moving forward.
 async fn age_quotes(manager: &crate::WalletManager, secs: u64) {
-    manager.prices.lock().await.age_by(secs);
+    manager.prices.age_by(secs);
 }
 
 /// The user's case: a price on screen, then a source that rate-limits.
@@ -423,6 +425,7 @@ async fn a_silent_source_times_out_as_unreachable() {
     let manager = priced_by(dir.path(), &source).await;
     let reading = manager.fetch_price().await.unwrap();
     assert!(unreached(&reading), "{reading:?}");
+    assert_eq!(source.requests(), 1, "the request reached the source");
 }
 
 /// No source at all, a closed port: the same.
@@ -431,8 +434,10 @@ async fn a_closed_port_is_unreachable() {
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path()).await;
     price_by(&manager, PriceSource::Coingecko, FiatCurrency::Eur).await;
-    manager.prices.lock().await.endpoints.coingecko =
-        format!("http://{}/api/v3", closed_port().await);
+    let closed = format!("http://{}/api/v3", closed_port().await);
+    manager
+        .prices
+        .point(|endpoints| endpoints.coingecko = closed);
     assert!(unreached(&manager.fetch_price().await.unwrap()));
 }
 

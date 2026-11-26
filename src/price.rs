@@ -427,10 +427,10 @@ fn price_error(detail: String) -> CoreError {
     }
 }
 
-/// A request not sent: the source asked to be left alone until `until`.
-pub(crate) fn waiting_error(source: PriceSource, until: u64) -> CoreError {
+/// A request not sent: the source asked to be left alone `secs` more.
+pub(crate) fn waiting_error(source: PriceSource, secs: u64) -> CoreError {
     price_error(format!(
-        "{} asked to wait until {until}: nothing sent",
+        "{} asked to wait {secs} s more: nothing sent",
         source.label()
     ))
 }
@@ -533,12 +533,15 @@ const MAX_POINTS: usize = 480;
 /// Fetches a BTC price series from one source, through `proxy` when
 /// the manager resolved one. The source must support the range
 /// (`PriceSource::supports`); callers hide unsupported ranges.
+/// `closing`, the last quote of the pair, closes mempool.space's hourly
+/// series (see [`closed_by`]).
 pub(crate) async fn fetch_price_history(
     source: PriceSource,
     currency: FiatCurrency,
     range: PriceRange,
     proxy: Option<&str>,
     endpoints: &Endpoints,
+    closing: Option<&PriceQuote>,
 ) -> Result<PriceHistory, Failure> {
     check_history(source, currency, range).map_err(|e| refused(e.to_string()))?;
     let mut points = match source {
@@ -562,8 +565,7 @@ pub(crate) async fn fetch_price_history(
         }
         PriceSource::MempoolSpace => {
             let series = mempool_series(currency, proxy, endpoints).await?;
-            let now = fetch_price(source, currency, proxy, endpoints).await.ok();
-            closed_by(&series, now.as_ref())
+            closed_by(&series, closing)
         }
     };
     points.retain(|p| p.rate.is_finite() && p.rate > 0.0);
@@ -669,9 +671,9 @@ async fn mempool_series(
     Ok(series)
 }
 
-/// The series with the price now as its last point: mempool.space's
+/// The series with the last quote as its last point: mempool.space's
 /// hourly series ends up to an hour before the price shown beside the
-/// chart. A price that did not come leaves the series as it is.
+/// chart. With no quote kept, the series stays as it is.
 fn closed_by(series: &[PricePoint], now: Option<&PriceQuote>) -> Vec<PricePoint> {
     let mut points = series.to_vec();
     if let Some(now) = now {
@@ -900,7 +902,8 @@ mod tests {
                 FiatCurrency::Ngn,
                 PriceRange::Year,
                 None,
-                &public
+                &public,
+                None,
             )
             .await
             .is_err()
@@ -1109,6 +1112,7 @@ mod tests {
                     range,
                     None,
                     &Endpoints::default(),
+                    None,
                 )
                 .await
                 {
