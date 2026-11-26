@@ -153,6 +153,9 @@ pub struct Shared {
     complete_here: std::sync::Mutex<HashSet<String>>,
     /// The servers the syncs try after the others for a while.
     relegated: std::sync::Mutex<sync::Relegations>,
+    /// The test of a backend under way for each network: see
+    /// [`WalletManager::check_backend`].
+    pub(crate) backend_checks: std::sync::Mutex<settings::BackendChecks>,
 }
 
 /// The last sync of a wallet to finish, when it started and how far it
@@ -198,6 +201,7 @@ impl WalletManager {
                 sync_board: std::sync::Mutex::new(sync::SyncBoard::default()),
                 complete_here: std::sync::Mutex::new(HashSet::new()),
                 relegated: std::sync::Mutex::new(sync::Relegations::default()),
+                backend_checks: std::sync::Mutex::new(settings::BackendChecks::default()),
             }),
         })
     }

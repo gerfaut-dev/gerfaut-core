@@ -55,6 +55,9 @@ pub enum BackendCheck {
         server_network: Option<Network>,
         tor: bool,
     },
+    /// Stopped before it ended, by the person or by a newer test of the
+    /// same network: the backend is saved, and untested.
+    Cancelled,
 }
 
 /// What stands between a saved backend and a working one.

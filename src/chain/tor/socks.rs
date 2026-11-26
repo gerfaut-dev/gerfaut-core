@@ -291,7 +291,28 @@ where
             )
         })??;
 
-    let mut upstream = match connect(host, port).await {
+    // A client says nothing until the reply: what it sends meanwhile
+    // is data sent ahead, kept for the upstream. One that hangs up
+    // takes the attempt with it, rather than leave a circuit to an
+    // onion being built for no one.
+    let mut ahead = [0u8; 512];
+    let mut sent_ahead = 0;
+    let connecting = connect(host, port);
+    tokio::pin!(connecting);
+    let connected = loop {
+        // Full: the rest waits in the socket, behind what was kept.
+        if sent_ahead == ahead.len() {
+            break connecting.await;
+        }
+        tokio::select! {
+            connected = &mut connecting => break connected,
+            read = stream.read(&mut ahead[sent_ahead..]) => match read {
+                Ok(0) | Err(_) => return Ok(()),
+                Ok(sent) => sent_ahead += sent,
+            },
+        }
+    };
+    let mut upstream = match connected {
         Ok(upstream) => upstream,
         Err(error) => {
             reply(&mut stream, reply_code(&error)).await?;
@@ -299,6 +320,7 @@ where
         }
     };
     reply(&mut stream, REPLY_SUCCEEDED).await?;
+    upstream.write_all(&ahead[..sent_ahead]).await?;
     tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
     Ok(())
 }
@@ -721,6 +743,66 @@ mod tests {
             .await
             .expect("the proxy closes the stream instead of waiting");
         assert!(closed(&read), "{read:?}");
+    }
+
+    /// A client that hangs up while its target is being reached takes
+    /// the attempt with it, data sent ahead or not: the connect future
+    /// is dropped, not left to build a circuit for no one.
+    #[tokio::test]
+    async fn a_client_that_leaves_takes_the_attempt_with_it() {
+        let (dropped, mut told) = tokio::sync::mpsc::channel::<()>(1);
+        /// Tells the test when it is dropped.
+        struct Attempt(tokio::sync::mpsc::Sender<()>);
+        impl Drop for Attempt {
+            fn drop(&mut self) {
+                let _ = self.0.try_send(());
+            }
+        }
+        let proxy = proxy(move |_host: String, _port: u16| {
+            let attempt = Attempt(dropped.clone());
+            async move {
+                let _attempt = attempt;
+                std::future::pending::<io::Result<TcpStream>>().await
+            }
+        })
+        .await;
+        // Gone at once, and gone after sending data ahead of the reply.
+        for ahead in [&b""[..], b"ping"] {
+            let mut stream = greet(proxy).await;
+            let mut request = vec![VERSION, CMD_CONNECT, 0];
+            request.extend_from_slice(&domain("slow.onion"));
+            request.extend_from_slice(&50001u16.to_be_bytes());
+            stream.write_all(&request).await.unwrap();
+            stream.write_all(ahead).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(1), told.recv())
+                .await
+                .expect("the attempt is dropped once the client is gone");
+        }
+    }
+
+    /// Data a client sends before the reply reaches the upstream first.
+    #[tokio::test]
+    async fn data_sent_ahead_of_the_reply_reaches_the_upstream() {
+        let echo = echo_server().await;
+        let proxy = proxy(move |_host: String, _port: u16| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            TcpStream::connect(echo).await
+        })
+        .await;
+        let mut stream = greet(proxy).await;
+        let mut request = vec![VERSION, CMD_CONNECT, 0];
+        request.extend_from_slice(&domain("echo.onion"));
+        request.extend_from_slice(&50001u16.to_be_bytes());
+        request.extend_from_slice(b"ping");
+        stream.write_all(&request).await.unwrap();
+        let mut reply = [0u8; 10];
+        stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], REPLY_SUCCEEDED);
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).await.unwrap();
+        assert_eq!(&back, b"ping");
     }
 
     #[tokio::test]
