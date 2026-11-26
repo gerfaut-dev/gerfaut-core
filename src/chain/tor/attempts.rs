@@ -186,6 +186,16 @@ impl<C: Isolate> Routes<C> {
         let key = host.trim_end_matches('.').to_ascii_lowercase();
         let first = self.first(&key);
         let seconded = std::sync::atomic::AtomicBool::new(false);
+        // A stream given up once its second attempt has begun (its client
+        // gone, a test cancelled) settles the route as one where neither
+        // connected: the next stream must not wait again on what hung.
+        let mut given_up = GivenUp {
+            routes: self,
+            key: &key,
+            first: &first,
+            seconded: &seconded,
+            settled: false,
+        };
         let through = |client: C, host: String| {
             let opened = open(client.clone(), host, port);
             async move { opened.await.map(|stream| (stream, client)) }
@@ -199,11 +209,29 @@ impl<C: Isolate> Routes<C> {
             TRY,
         )
         .await;
+        given_up.settled = true;
         if seconded.load(std::sync::atomic::Ordering::Relaxed) {
             let used = connected.as_ref().ok().map(|(_, used)| used);
             self.settle(&key, &first, used);
         }
         connected.map(|(stream, _)| stream)
+    }
+}
+
+/// [`Routes::connect`] dropped before it settled the route it moved.
+struct GivenUp<'a, C: Isolate> {
+    routes: &'a Routes<C>,
+    key: &'a str,
+    first: &'a C,
+    seconded: &'a std::sync::atomic::AtomicBool,
+    settled: bool,
+}
+
+impl<C: Isolate> Drop for GivenUp<'_, C> {
+    fn drop(&mut self) {
+        if !self.settled && self.seconded.load(std::sync::atomic::Ordering::Relaxed) {
+            self.routes.settle(self.key, self.first, None);
+        }
     }
 }
 
@@ -465,6 +493,23 @@ mod tests {
         let silent = |_: usize, _: &str| None;
         let error = stream(&routes, "x.onion", silent).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let answers_third =
+            |id: usize, _: &str| (id == 2).then_some((Duration::from_secs(1), true));
+        let begun = tokio::time::Instant::now();
+        assert_eq!(stream(&routes, "x.onion", answers_third).await.unwrap(), 2);
+        assert_eq!(begun.elapsed(), Duration::from_secs(1));
+    }
+
+    /// A stream given up while both attempts hang, as a client that
+    /// stops waiting does, still sends the service to a new route: the
+    /// next stream does not wait again on the rendezvous that hung.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_given_up_on_two_hangs_moves_the_route() {
+        let routes = routes();
+        let silent = |_: usize, _: &str| None;
+        let gone =
+            tokio::time::timeout(Duration::from_secs(45), stream(&routes, "x.onion", silent));
+        assert!(gone.await.is_err(), "both attempts hang");
         let answers_third =
             |id: usize, _: &str| (id == 2).then_some((Duration::from_secs(1), true));
         let begun = tokio::time::Instant::now();
