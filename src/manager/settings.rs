@@ -76,10 +76,48 @@ impl WalletManager {
     /// it: the certificates accepted, the Tor route for an onion. A Tor
     /// that cannot be had is the answer, not an error: the screen says
     /// so beside the other failures. Reads only.
-    pub async fn check_backend(&self, network: Network) -> CoreResult<BackendCheck> {
+    ///
+    /// One test runs for each network: a newer one, or
+    /// [`Self::cancel_backend_check`], stops it, and it answers
+    /// [`BackendCheck::Cancelled`] at once. Its connections are closed
+    /// as it stops, and the backend stays saved, untested. The test
+    /// takes its place when it is asked for, not when it is first
+    /// awaited: tests stop in the order they were asked, and a cancel
+    /// sent right after reaches it.
+    pub fn check_backend(
+        &self,
+        network: Network,
+    ) -> impl Future<Output = CoreResult<BackendCheck>> + Send + '_ {
+        let (slot, stopped) = BackendSlot::take(self, network);
+        async move {
+            let outcome = tokio::select! {
+                biased;
+                _ = stopped => Ok(BackendCheck::Cancelled),
+                checked = self.run_backend_check(network) => checked,
+            };
+            drop(slot);
+            outcome
+        }
+    }
+
+    /// Stops the test of `network`'s backend under way, if one is:
+    /// whether one was.
+    pub fn cancel_backend_check(&self, network: Network) -> bool {
+        self.backend_checks().running.remove(&network).is_some()
+    }
+
+    /// Held for a few instructions, never across an await: a test that
+    /// panicked there left nothing half done.
+    fn backend_checks(&self) -> std::sync::MutexGuard<'_, BackendChecks> {
+        self.backend_checks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    async fn run_backend_check(&self, network: Network) -> CoreResult<BackendCheck> {
         let (config, certs) = self.state.lock().await.chain_setup(network);
         let endpoints = chain::endpoints(&config, network, &certs)?;
-        let proxy = match self.tor_proxy_for(&endpoints).await {
+        let proxy = match self.tor_proxy_apart(&endpoints).await {
             Ok(proxy) => proxy,
             Err(error) => {
                 return Ok(BackendCheck::Failed {
@@ -362,6 +400,21 @@ impl WalletManager {
         Ok(Some(route.proxy()))
     }
 
+    /// [`Self::tor_proxy_for`] on a task of its own: a test that is
+    /// cancelled while the built-in Tor starts lets it finish starting,
+    /// instead of leaving it half started. That Tor is the app's, and
+    /// the syncs take it next.
+    async fn tor_proxy_apart(&self, endpoints: &[Endpoint]) -> CoreResult<Option<String>> {
+        if !chain::needs_tor(endpoints) {
+            return Ok(None);
+        }
+        let (settings, data_dir) = self.tor_setup().await;
+        tokio::spawn(async move { tor::resolve(&settings, &data_dir).await })
+            .await
+            .map_err(|_| CoreError::Tor("Tor stopped before it started".to_owned()))?
+            .map(|route| Some(route.proxy()))
+    }
+
     /// What resolving a route needs from the state, copied out.
     pub(super) async fn tor_setup(&self) -> (TorSettings, PathBuf) {
         let state = self.state.lock().await;
@@ -440,3 +493,55 @@ impl WalletManager {
 
 #[cfg(test)]
 mod tests;
+
+/// The tests of a backend under way, by network, each with what stops
+/// it: dropping its sender, by a cancel or a newer test, ends it.
+#[derive(Default)]
+pub(crate) struct BackendChecks {
+    running: std::collections::HashMap<Network, (u64, tokio::sync::oneshot::Sender<()>)>,
+    issued: u64,
+}
+
+/// One test's place among [`BackendChecks`], given back when the test
+/// ends however it ends, unless a newer test took it.
+struct BackendSlot<'a> {
+    manager: &'a WalletManager,
+    network: Network,
+    id: u64,
+}
+
+impl<'a> BackendSlot<'a> {
+    fn take(
+        manager: &'a WalletManager,
+        network: Network,
+    ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let mut checks = manager.backend_checks();
+        checks.issued += 1;
+        let id = checks.issued;
+        // The test before this one, if any, stops here.
+        checks.running.insert(network, (id, stop));
+        drop(checks);
+        (
+            BackendSlot {
+                manager,
+                network,
+                id,
+            },
+            stopped,
+        )
+    }
+}
+
+impl Drop for BackendSlot<'_> {
+    fn drop(&mut self) {
+        let mut checks = self.manager.backend_checks();
+        if checks
+            .running
+            .get(&self.network)
+            .is_some_and(|(id, _)| *id == self.id)
+        {
+            checks.running.remove(&self.network);
+        }
+    }
+}

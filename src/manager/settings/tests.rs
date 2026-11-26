@@ -605,6 +605,147 @@ async fn a_backend_is_tested_as_stored() {
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
 }
 
+/// A server that takes the connection and never answers, and the
+/// backend that points to it.
+async fn silent_backend() -> (tokio::net::TcpListener, BackendConfig) {
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("tcp://{}", silent.local_addr().unwrap());
+    (
+        silent,
+        BackendConfig::CustomElectrum {
+            url,
+            own_node: true,
+        },
+    )
+}
+
+/// The connection a test opened to `silent`, once it is there.
+async fn tested(silent: &tokio::net::TcpListener) -> tokio::net::TcpStream {
+    let (socket, _) = tokio::time::timeout(std::time::Duration::from_secs(5), silent.accept())
+        .await
+        .expect("the test connects")
+        .unwrap();
+    socket
+}
+
+/// Whether the other end of `socket` closed it within a second, what
+/// it sent before read and set aside.
+async fn closed(mut socket: tokio::net::TcpStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    let mut sent = [0u8; 256];
+    let reading = async {
+        loop {
+            match socket.read(&mut sent).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(1), reading)
+        .await
+        .is_ok()
+}
+
+/// A test of a server that does not answer stops at once when it is
+/// cancelled, its connection closed, and the backend stays saved.
+#[tokio::test]
+async fn a_backend_test_is_cancelled_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let (silent, backend) = silent_backend().await;
+    manager
+        .set_backend(Network::Signet, backend.clone())
+        .await
+        .unwrap();
+    assert!(!manager.cancel_backend_check(Network::Signet));
+
+    let testing = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.check_backend(Network::Signet).await }
+    });
+    let socket = tested(&silent).await;
+    assert!(!manager.cancel_backend_check(Network::Mainnet));
+    let cancelled = Instant::now();
+    assert!(manager.cancel_backend_check(Network::Signet));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), testing)
+        .await
+        .expect("a cancelled test answers at once")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, BackendCheck::Cancelled);
+    assert!(cancelled.elapsed() < std::time::Duration::from_millis(500));
+    assert!(closed(socket).await, "the test left its connection open");
+
+    assert_eq!(
+        manager.settings().await.backends.get(&Network::Signet),
+        Some(&backend)
+    );
+    assert!(!manager.cancel_backend_check(Network::Signet));
+}
+
+/// A test is in its place once asked for, before anything awaits it:
+/// a cancel sent at once stops it, and of two tests asked in turn, the
+/// later one is the one that runs.
+#[tokio::test]
+async fn a_backend_test_counts_from_when_it_is_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let (_silent, backend) = silent_backend().await;
+    manager.set_backend(Network::Signet, backend).await.unwrap();
+
+    let asked = manager.check_backend(Network::Signet);
+    assert!(manager.cancel_backend_check(Network::Signet));
+    assert_eq!(asked.await.unwrap(), BackendCheck::Cancelled);
+
+    let first = manager.check_backend(Network::Signet);
+    let second = manager.check_backend(Network::Signet);
+    assert_eq!(first.await.unwrap(), BackendCheck::Cancelled);
+    assert!(manager.cancel_backend_check(Network::Signet));
+    assert_eq!(second.await.unwrap(), BackendCheck::Cancelled);
+}
+
+/// A newer test of a network stops the one before it, which answers
+/// cancelled and closes its connection; a cancel then stops the newer.
+#[tokio::test]
+async fn a_newer_backend_test_replaces_the_one_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let (silent, backend) = silent_backend().await;
+    manager.set_backend(Network::Signet, backend).await.unwrap();
+
+    let test = || {
+        let manager = manager.clone();
+        tokio::spawn(async move { manager.check_backend(Network::Signet).await })
+    };
+    let first = test();
+    let first_socket = tested(&silent).await;
+    let second = test();
+    let second_socket = tested(&silent).await;
+
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), first)
+        .await
+        .expect("the older test answers once replaced")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, BackendCheck::Cancelled);
+    assert!(
+        closed(first_socket).await,
+        "the older test left its connection open"
+    );
+
+    assert!(manager.cancel_backend_check(Network::Signet));
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+        .await
+        .expect("the newer test answers once cancelled")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, BackendCheck::Cancelled);
+    assert!(
+        closed(second_socket).await,
+        "the newer test left its connection open"
+    );
+}
+
 /// The settings screen asks for a server's certificate before it saves
 /// the address: a key or an address typed as its host is refused there
 /// too, and never looked up, nor stored.

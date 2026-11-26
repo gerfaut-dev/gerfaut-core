@@ -748,6 +748,7 @@ fn chain() -> Vec<Fixture> {
                         tor: false,
                     },
                 ),
+                ("cancelled", BackendCheck::Cancelled),
             ],
         ),
         fixture("CertificateStatus", statuses),
