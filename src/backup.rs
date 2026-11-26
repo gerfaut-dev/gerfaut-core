@@ -26,7 +26,7 @@ use crate::error::{CoreError, CoreResult, VaultError};
 use crate::network::Network;
 use crate::store::VaultKey;
 use crate::store::cipher::{self, BACKUP_MAGIC};
-use crate::wallet::meta::{WalletKind, WalletMeta};
+use crate::wallet::meta::{WalletIcon, WalletKind, WalletMeta};
 
 /// Payload schema version written by this build.
 pub const BACKUP_VERSION: u32 = 1;
@@ -79,6 +79,12 @@ pub struct BackupWallet {
     /// with no wallet pinned reads as one written before pinning.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub live_pinned: bool,
+    /// The icon chosen for it: see [`WalletIcon`]. Left out while it is
+    /// the generic wallet, so such a backup reads as one written before
+    /// icons rode along; a build that does not know the field, or the
+    /// name, restores the generic wallet.
+    #[serde(default, skip_serializing_if = "WalletIcon::is_generic")]
+    pub icon: WalletIcon,
 }
 
 /// Everything a backup decrypts to. The settings fields are present
@@ -403,6 +409,7 @@ mod tests {
                     labels: BTreeMap::from([("addr:tb1q".to_owned(), "rent".to_owned())]),
                     created_at: 1_754_000_000,
                     live_pinned: true,
+                    icon: WalletIcon::default(),
                 },
                 BackupWallet {
                     name: "Watched".to_owned(),
@@ -414,6 +421,7 @@ mod tests {
                     labels: BTreeMap::new(),
                     created_at: 1_754_000_001,
                     live_pinned: false,
+                    icon: WalletIcon::default(),
                 },
             ],
             backends: Some(BTreeMap::from([(
@@ -458,6 +466,23 @@ mod tests {
         assert!(!json.contains("backends"), "{json}");
         let opened = open(&seal(&bare, PASSWORD).unwrap(), PASSWORD).unwrap();
         assert_eq!(opened, bare);
+    }
+
+    /// A wallet's chosen icon rides in the backup; the generic one says
+    /// nothing, the way a backup written before icons rode along reads,
+    /// and a name this build does not know restores the generic wallet.
+    #[test]
+    fn an_icon_rides_along_only_when_chosen() {
+        let mut chosen = payload();
+        chosen.wallets[0].icon = WalletIcon::Snowflake;
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert_eq!(json.matches(r#""icon":"snowflake""#).count(), 1, "{json}");
+        assert_eq!(json.matches(r#""icon":"#).count(), 1, "{json}");
+        let read: BackupPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(read, chosen);
+        let newer = r#"{"name":"New","network":"signet","kind":{"type":"single_address","address":"tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"},"gap_limit":20,"created_at":1,"icon":"a_device_not_drawn_yet"}"#;
+        let wallet: BackupWallet = serde_json::from_str(newer).unwrap();
+        assert_eq!(wallet.icon, WalletIcon::Wallet);
     }
 
     /// A wallet pinned to the live watch says so in the backup; one that

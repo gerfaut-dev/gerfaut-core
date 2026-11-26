@@ -1499,6 +1499,31 @@ mod tests {
         assert_eq!(progress.text.unwrap(), format!("wpkh({TPUB}/0/*)"));
     }
 
+    /// A descriptor scanned from a plain QR code is read as the same
+    /// text pasted is: a descriptor, never the address it would derive
+    /// first. A scanner may hand the frame over with a line break.
+    #[test]
+    fn a_scanned_descriptor_reads_as_the_pasted_one() {
+        for descriptor in [
+            format!("wpkh({TPUB}/0/*)"),
+            format!("wpkh({TPUB}/<0;1>/*)"),
+            format!("tr({TPUB}/0/*)"),
+            format!("sh(wsh(pk({TPUB}/0/*)))"),
+        ] {
+            let pasted = crate::input::parse_input(&descriptor).unwrap();
+            for frame in [descriptor.clone(), format!("{descriptor}\n")] {
+                let text = assemble(&[frame]).unwrap().text.unwrap();
+                let scanned = crate::input::parse_input(&text).unwrap();
+                assert_ne!(
+                    scanned.kind,
+                    crate::input::RecognizedKind::Address,
+                    "{descriptor}"
+                );
+                assert_eq!(scanned.kind, pasted.kind, "{descriptor}");
+            }
+        }
+    }
+
     #[test]
     fn crypto_output_single_key_without_children_watches_both_branches() {
         let ur_text = encode_ur("crypto-output", &tag(TAG_WPKH, hdkey(None)));

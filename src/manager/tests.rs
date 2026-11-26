@@ -56,6 +56,7 @@ async fn private_keys_never_reach_the_vault() {
                 labels: Default::default(),
                 created_at: 1_755_000_000,
                 live_pinned: false,
+                icon: WalletIcon::default(),
             }],
             backends: None,
             electrum_certs: None,

@@ -90,7 +90,7 @@ pub(crate) async fn open(
             .connect(name, socket)
             .await
             .map(|stream| Box::new(stream) as BoxStream)
-            .map_err(|e| Fault::outage(format!("TLS handshake failed: {e}")))
+            .map_err(|e| Fault::outage(tls::handshake_failed(&e)))
     };
     match tokio::time::timeout(budget, opening).await {
         Ok(result) => result,
