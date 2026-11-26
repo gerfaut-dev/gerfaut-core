@@ -1,0 +1,35 @@
+{
+  "fresh": {
+    "state": "fresh",
+    "quote": {
+      "rate": 92034.25,
+      "currency": "eur",
+      "source": "mempool_space",
+      "at": 1750000000
+    }
+  },
+  "kept": {
+    "state": "kept",
+    "quote": {
+      "rate": 92034.25,
+      "currency": "eur",
+      "source": "mempool_space",
+      "at": 1750000000
+    },
+    "trouble": {
+      "kind": "rate_limited",
+      "since": 1750000060,
+      "next_try": 1750000180,
+      "lasting": false
+    }
+  },
+  "missing": {
+    "state": "missing",
+    "trouble": {
+      "kind": "unreachable",
+      "since": 1750000060,
+      "next_try": 1750000900,
+      "lasting": true
+    }
+  }
+}

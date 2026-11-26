@@ -229,6 +229,7 @@
         }
       }
     ],
-    "refresh_secs": 60
+    "refresh_secs": 60,
+    "keep_secs": 21600
   }
 }
