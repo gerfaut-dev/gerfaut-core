@@ -1,15 +1,15 @@
-//! Release update check against GitHub, and the rule both apps follow.
+//! Release update check against the site, and the rule both apps follow.
 //!
-//! Read-only: one request for the latest release of the app's own
-//! repository, which sends the version in no way and nothing about the
-//! wallets. The apps run it from a button, and on their own at most
-//! once a day unless the user turned that off. Failures (offline,
-//! private repository, rate limit) degrade to "could not check", never
-//! to an error state.
+//! Read-only: one request for the file the site keeps for the app,
+//! [`RELEASES_SITE`] and [`ReleaseFeed`], which sends the version in no
+//! way and nothing about the wallets. The apps run it from a button, and
+//! on their own at most once a day unless the user turned that off.
+//! Failures (offline, a file missing or unreadable) degrade to "could
+//! not check", never to an error state.
 //!
 //! The request goes out through the wallet manager and nowhere else,
 //! because it has to take the route the syncs take. Someone who reaches
-//! their backend through Tor does not expect the app to show GitHub
+//! their backend through Tor does not expect the app to show the site
 //! their address once a day: with an onion backend configured the check
 //! goes through the same Tor proxy, and when Tor cannot be had it does
 //! not go at all.
@@ -60,7 +60,7 @@ pub struct UpdateRecord {
     /// clock that could be right ([`UpdateRecord::session_at`]). No
     /// check goes out on its own within a day of it: a new install is up
     /// to date, and the user gets to see the setting before the app
-    /// speaks to GitHub.
+    /// asks anything.
     #[serde(default)]
     pub(crate) first_session_at: Option<u64>,
     /// When the last check the app made on its own went out, answered
@@ -308,54 +308,89 @@ impl fmt::Display for Version {
     }
 }
 
-/// Where the releases are read from.
-pub(crate) const GITHUB_API: &str = "https://api.github.com";
+/// Where the releases are read from: the site, which keeps one file per
+/// app. Not a code host's API: the account that hosts the code can
+/// change, and an install must still hear of the next version. Every
+/// version from 0.1.1 on reads this address, so it never changes.
+pub(crate) const RELEASES_SITE: &str = "https://gerfaut-wallet.com/releases";
 
-/// The version of GitHub's REST API the check is written against, which
-/// GitHub's documentation asks each request to name: the latest, whose
-/// changes leave the release and its tag as they were.
-pub(crate) const GITHUB_API_VERSION: &str = "2026-03-10";
+/// [`RELEASES_SITE`]; in a debug build only, the address the
+/// `GERFAUT_RELEASES_SITE` variable names instead, so that a developer
+/// can see the notice against a file served on their own machine, such
+/// as `http://127.0.0.1:8765`: the variable of the running process, or
+/// else the one the build saw, since an Android app is started with no
+/// variable of ours. A release build reads neither: its check goes to
+/// the site and nowhere else.
+pub(crate) fn releases_site() -> std::borrow::Cow<'static, str> {
+    #[cfg(debug_assertions)]
+    if let Some(site) = std::env::var("GERFAUT_RELEASES_SITE")
+        .ok()
+        .or_else(|| option_env!("GERFAUT_RELEASES_SITE").map(str::to_owned))
+        .filter(|site| !site.is_empty())
+    {
+        return site.into();
+    }
+    RELEASES_SITE.into()
+}
 
-/// Asks for the latest release of `owner/repo` and gives back its tag.
-/// `proxy` is the Tor SOCKS proxy the manager resolved when the check
-/// has to go through Tor; the name of the host then goes to the proxy,
-/// never to a resolver.
-///
-/// A version GitHub no longer supports is answered `410 Gone`: an
-/// install left without updates for years, the one the check is for,
-/// then asks once more without naming one, as GitHub reads it by
-/// default. Once, and both requests within the one budget of the check.
-pub(crate) async fn latest_tag(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
-    latest_tag_within(api, repo, proxy, budget(proxy)).await
+/// The app that asks, and so the file it reads on the site. Each file
+/// holds `{"tag_name": "v1.2.3"}`, the tag of the app's latest release;
+/// the field and the two names are read by every version from 0.1.1 on,
+/// and never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseFeed {
+    /// The desktop app, every system.
+    Desktop,
+    /// The Android app. The iPhone app asks nothing: TestFlight and the
+    /// App Store bring its versions.
+    Android,
+}
+
+impl ReleaseFeed {
+    fn file(self) -> &'static str {
+        match self {
+            ReleaseFeed::Desktop => "desktop.json",
+            ReleaseFeed::Android => "android.json",
+        }
+    }
+}
+
+/// Asks the site for the latest release of `feed` and gives back its
+/// tag. `site` is [`releases_site`] but in tests. `proxy` is the Tor
+/// SOCKS proxy the manager resolved when the check has to go through
+/// Tor; the name of the host then goes to the proxy, never to a
+/// resolver.
+pub(crate) async fn latest_tag(
+    site: &str,
+    feed: ReleaseFeed,
+    proxy: Option<&str>,
+) -> CoreResult<String> {
+    latest_tag_within(site, feed, proxy, budget(proxy)).await
 }
 
 /// [`latest_tag`], all of it within `budget`.
 pub(crate) async fn latest_tag_within(
-    api: &str,
-    repo: &str,
+    site: &str,
+    feed: ReleaseFeed,
     proxy: Option<&str>,
     budget: std::time::Duration,
 ) -> CoreResult<String> {
-    tokio::time::timeout(budget, ask_latest(api, repo, proxy))
+    tokio::time::timeout(budget, ask_latest(site, feed, proxy))
         .await
         .map_err(|_| check_error("timed out".to_owned()))?
 }
 
-async fn ask_latest(api: &str, repo: &str, proxy: Option<&str>) -> CoreResult<String> {
-    let client = client(proxy)?;
-    let ask = |version: Option<&'static str>| {
-        let mut request = client
-            .get(format!("{api}/repos/{repo}/releases/latest"))
-            .header("Accept", "application/vnd.github+json");
-        if let Some(version) = version {
-            request = request.header("X-GitHub-Api-Version", version);
-        }
-        request.send()
-    };
-    let mut response = ask(Some(GITHUB_API_VERSION)).await.map_err(failed)?;
-    if response.status() == reqwest::StatusCode::GONE {
-        response = ask(None).await.map_err(failed)?;
-    }
+/// One request, and no retry whatever it answers: a check that fails
+/// waits for the next day, or the next press of the button. A redirect
+/// is followed only to the same origin over HTTPS, as for every request
+/// of the core ([`crate::chain::redirects`]).
+async fn ask_latest(site: &str, feed: ReleaseFeed, proxy: Option<&str>) -> CoreResult<String> {
+    let response = client(proxy)?
+        .get(format!("{site}/{}", feed.file()))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(failed)?;
     if !response.status().is_success() {
         return Err(check_error(format!("http {}", response.status())));
     }
@@ -401,9 +436,9 @@ fn client(proxy: Option<&str>) -> CoreResult<reqwest::Client> {
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
-/// Largest answer read from the releases API: one release, its notes
-/// and its assets fit many times over.
-const MAX_ANSWER: usize = 1 << 20;
+/// Largest answer read from the site: the file is a few dozen bytes, and
+/// anything near this size is not that file.
+const MAX_ANSWER: usize = 16 * 1024;
 
 /// Longest version taken: `v1.2.3` and any suffix a release could carry
 /// fit well within it.
@@ -423,7 +458,7 @@ fn read_tag(value: &serde_json::Value) -> CoreResult<String> {
 
 fn check_error(detail: String) -> CoreError {
     CoreError::Sync {
-        backend: "github".to_owned(),
+        backend: "releases".to_owned(),
         detail,
     }
 }
@@ -467,6 +502,21 @@ mod tests {
         assert!(read("v1.0.0 <b>").is_err());
         assert!(read_tag(&serde_json::json!({ "tag_name": 2 })).is_err());
         assert!(read_tag(&serde_json::json!({})).is_err());
+    }
+
+    /// Every version from 0.1.1 on reads these two addresses: they never
+    /// change.
+    #[test]
+    fn the_two_files_stay_where_they_are() {
+        let at = |feed: ReleaseFeed| format!("{RELEASES_SITE}/{}", feed.file());
+        assert_eq!(
+            at(ReleaseFeed::Desktop),
+            "https://gerfaut-wallet.com/releases/desktop.json"
+        );
+        assert_eq!(
+            at(ReleaseFeed::Android),
+            "https://gerfaut-wallet.com/releases/android.json"
+        );
     }
 
     /// The check goes out straight, or through the Tor proxy, and never

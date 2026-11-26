@@ -13,7 +13,7 @@
 
 use crate::error::{CoreError, CoreResult};
 use crate::now_secs;
-use crate::updates::{self, GITHUB_API, UpdateRecord, UpdateStatus, Version};
+use crate::updates::{self, ReleaseFeed, UpdateRecord, UpdateStatus, Version};
 
 use super::WalletManager;
 
@@ -31,7 +31,7 @@ impl WalletManager {
 
     /// A session is open: the app is on screen and unlocked, and says so
     /// as the session opens and from time to time while it lasts. The
-    /// release of `owner/repo` is asked for when a check is due, at most
+    /// latest release of `feed` is asked for when a check is due, at most
     /// once a day and never within a day of the first session, and the
     /// status that follows comes back.
     ///
@@ -45,15 +45,15 @@ impl WalletManager {
     /// keep the client running. Without that Tor nothing is sent and
     /// the day does not count: the next session asks again, and the
     /// status says why nothing was asked.
-    pub async fn update_session(&self, repo: &str, current_version: &str) -> UpdateStatus {
-        self.update_session_at(GITHUB_API, repo, current_version, now_secs())
+    pub async fn update_session(&self, feed: ReleaseFeed, current_version: &str) -> UpdateStatus {
+        self.update_session_at(&updates::releases_site(), feed, current_version, now_secs())
             .await
     }
 
     pub(crate) async fn update_session_at(
         &self,
-        api: &str,
-        repo: &str,
+        site: &str,
+        feed: ReleaseFeed,
         current_version: &str,
         now: u64,
     ) -> UpdateStatus {
@@ -66,13 +66,13 @@ impl WalletManager {
         // does not wait a day more.
         self.note_update(|record| record.session_at(now)).await;
         if due {
-            self.check_on_its_own(api, repo, now).await;
+            self.check_on_its_own(site, feed, now).await;
         }
         self.update_status(current_version).await
     }
 
     /// The check a session found due.
-    async fn check_on_its_own(&self, api: &str, repo: &str, now: u64) {
+    async fn check_on_its_own(&self, site: &str, feed: ReleaseFeed, now: u64) {
         // Tor first, before the day is spent: the proxy is only ever
         // needed for Tor, and when none runs nothing goes out.
         let Ok(proxy) = self.running_beside_syncs_proxy().await else {
@@ -99,13 +99,13 @@ impl WalletManager {
                 return;
             }
         }
-        if let Ok(tag) = updates::latest_tag(api, repo, proxy.as_deref()).await {
+        if let Ok(tag) = updates::latest_tag(site, feed, proxy.as_deref()).await {
             self.note_update(|record| record.answered(&tag)).await;
         }
     }
 
-    /// Asks GitHub for the latest release of `owner/repo` now, due or
-    /// not: the button in Settings › About. When [`Self::uses_tor`] says
+    /// Asks the site for the latest release of `feed` now, due or not:
+    /// the button in Settings › About. When [`Self::uses_tor`] says
     /// so it goes through the Tor proxy a sync would resolve, and when
     /// that proxy cannot be had it fails with [`CoreError::Tor`] before
     /// any request exists: never a request in the clear. Anything else
@@ -116,17 +116,17 @@ impl WalletManager {
     /// counts as closed. The daily check keeps its own schedule.
     pub async fn check_update(
         &self,
-        repo: &str,
+        feed: ReleaseFeed,
         current_version: &str,
     ) -> CoreResult<UpdateStatus> {
-        self.check_update_at(GITHUB_API, repo, current_version)
+        self.check_update_at(&updates::releases_site(), feed, current_version)
             .await
     }
 
     pub(crate) async fn check_update_at(
         &self,
-        api: &str,
-        repo: &str,
+        site: &str,
+        feed: ReleaseFeed,
         current_version: &str,
     ) -> CoreResult<UpdateStatus> {
         let proxy = match self.beside_syncs_proxy().await {
@@ -137,7 +137,7 @@ impl WalletManager {
                 return Err(error);
             }
         };
-        let answer = updates::latest_tag(api, repo, proxy.as_deref()).await;
+        let answer = updates::latest_tag(site, feed, proxy.as_deref()).await;
         self.note_update(|record| {
             record.tor_unavailable = false;
             if let Ok(tag) = &answer {

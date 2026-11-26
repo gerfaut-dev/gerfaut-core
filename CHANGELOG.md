@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- The update check reads the latest release from the site, `https://gerfaut-wallet.com/releases/desktop.json` or `android.json`, which hold `{"tag_name": "v1.2.3"}`, instead of the GitHub API. `update_session` and `check_update` take a `ReleaseFeed` (`Desktop` or `Android`) instead of a repository. The request is one plain `GET`, with no retry, and follows a redirect only to the same origin over HTTPS; a file that is missing, unreadable or larger than 16 KiB finds nothing.
 - `fetch_price` answers a `PriceReading` instead of a quote. It is `fresh` with the quote the source just gave, `kept` with the last quote and the `PriceTrouble` that stopped a new one, or `missing` with the trouble alone. A `PriceTrouble` names its `kind` (`rate_limited`, `unreachable`, `refused` or `tor`), when it began, when the source is asked again, and whether it is `lasting`. It is lasting after a second failure in a row, or at once when Tor is missing.
 
 ### Removed
