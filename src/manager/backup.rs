@@ -59,6 +59,7 @@ impl WalletManager {
                     labels: record.meta.labels.clone(),
                     created_at: record.meta.created_at,
                     live_pinned: record.meta.live_pinned,
+                    icon: record.meta.icon,
                 })
                 .collect();
             BackupPayload {
@@ -205,6 +206,7 @@ impl WalletManager {
                         );
                         meta.labels = wallet.labels.clone();
                         meta.live_pinned = wallet.live_pinned;
+                        meta.icon = wallet.icon;
                         pending.push(record_with(meta, engine.map(|engine| *engine))?);
                     }
                     Fate::Refused(error) if !asked_by_index && is_refusal(&error) => {

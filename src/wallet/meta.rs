@@ -147,6 +147,13 @@ pub enum WalletIcon {
     Wallet,
 }
 
+impl WalletIcon {
+    /// Whether this is the generic wallet, the icon nobody chose.
+    pub fn is_generic(&self) -> bool {
+        *self == WalletIcon::Wallet
+    }
+}
+
 /// A wallet's identity as the apps read it: what the vault keeps of it
 /// ([`StoredMeta`]), and the gap limit of the settings, which every
 /// wallet shares. Only [`StoredMeta::presented`] makes one from a

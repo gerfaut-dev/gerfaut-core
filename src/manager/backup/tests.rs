@@ -6,7 +6,7 @@ use crate::chain::BackendConfig;
 use crate::input::parse_input;
 use crate::manager::tests::support::{ADDRESS, BACKUP_PASSWORD, key, manager, seeded};
 use crate::network::Network;
-use crate::wallet::meta::WalletMeta;
+use crate::wallet::meta::{WalletIcon, WalletMeta};
 
 fn fingerprint(byte: &str) -> String {
     vec![byte; 32].join(":")
@@ -30,6 +30,7 @@ async fn the_preview_names_what_the_settings_would_apply() {
         labels: Default::default(),
         created_at: 1_755_000_000,
         live_pinned: false,
+        icon: WalletIcon::default(),
     };
     let with_settings = BackupPayload {
         version: BACKUP_VERSION,
@@ -335,6 +336,50 @@ async fn backup_restores_wallets_in_a_fresh_vault() {
     assert_eq!(target.settings().await.gap_limit, 50);
 }
 
+/// A wallet's chosen icon comes back with it on the other device; one
+/// left generic stays generic.
+#[tokio::test]
+async fn backup_carries_the_icon_chosen() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let (source, cold, _watch) = seeded(source_dir.path()).await;
+    source
+        .set_wallet_icon(&cold.id, WalletIcon::Snowflake)
+        .await
+        .unwrap();
+    let options = BackupOptions {
+        wallet_ids: None,
+        include_settings: false,
+    };
+    let bundle = source
+        .export_backup(&options, BACKUP_PASSWORD)
+        .await
+        .unwrap();
+
+    let target_dir = tempfile::tempdir().unwrap();
+    let target = manager(target_dir.path()).await;
+    let choices = ImportChoices {
+        indexes: None,
+        apply_settings: false,
+    };
+    target
+        .import_backup(&bundle.data, BACKUP_PASSWORD, &choices)
+        .await
+        .unwrap();
+    let icons = target
+        .list_wallets(None)
+        .await
+        .iter()
+        .map(|m| (m.name.clone(), m.icon))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        icons,
+        vec![
+            ("Cold".to_owned(), WalletIcon::Snowflake),
+            ("Watch".to_owned(), WalletIcon::Wallet),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn backup_picks_wallets_on_both_sides() {
     let source_dir = tempfile::tempdir().unwrap();
@@ -506,6 +551,7 @@ async fn a_backup_wallet_the_parser_would_refuse_is_left_out() {
         labels: Default::default(),
         created_at: 1_755_000_000,
         live_pinned: false,
+        icon: WalletIcon::default(),
     };
     let dir = tempfile::tempdir().unwrap();
     let manager = manager(dir.path()).await;
@@ -681,6 +727,7 @@ async fn a_backup_pairing_two_wallets_is_not_restored() {
         labels: Default::default(),
         created_at: 1_755_000_000,
         live_pinned: false,
+        icon: WalletIcon::default(),
     };
     let payload = BackupPayload {
         version: BACKUP_VERSION,
@@ -808,6 +855,7 @@ async fn a_backup_hiding_another_wallet_in_a_raw_hash_is_not_restored() {
             labels: Default::default(),
             created_at: 1_755_000_000,
             live_pinned: false,
+            icon: WalletIcon::default(),
         }],
         backends: None,
         electrum_certs: None,
@@ -949,6 +997,7 @@ async fn a_backup_wallet_without_a_name_is_left_out() {
         labels: Default::default(),
         created_at: 1_755_000_000,
         live_pinned: false,
+        icon: WalletIcon::default(),
     };
     let payload = BackupPayload {
         version: BACKUP_VERSION,
@@ -1191,6 +1240,7 @@ fn signet_wallet(name: &str, branch: u32) -> BackupWallet {
         labels: Default::default(),
         created_at: 1_755_000_000,
         live_pinned: false,
+        icon: WalletIcon::default(),
     }
 }
 
