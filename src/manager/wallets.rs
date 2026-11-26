@@ -379,15 +379,7 @@ impl WalletManager {
         match &record.meta.kind {
             WalletKind::Descriptors { .. } => {
                 let engine = ensure_engine(&mut state, id)?;
-                let list = views::address_list(engine);
-                // Revealing may stage a change set; persist it.
-                let staged = engine.take_staged();
-                if let Some(staged) = staged {
-                    merge_changeset(&mut state, id, staged)?;
-                    let state = &mut *state;
-                    state.vault.save(&state.payload)?;
-                }
-                Ok(list)
+                Ok(views::address_list(engine))
             }
             WalletKind::SingleAddress { address } => {
                 let (used, balance_sats) = record
