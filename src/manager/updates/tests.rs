@@ -298,8 +298,9 @@ async fn an_older_or_the_same_version_announces_nothing() {
     }
 }
 
-/// The site sends the check elsewhere: it does not go. Only the file
-/// at the address the app holds is read.
+/// The site sends the check to another origin: it does not go. A
+/// redirect is followed only within the site, over HTTPS
+/// (`chain::redirects`).
 #[tokio::test]
 async fn a_redirection_is_not_followed() {
     let elsewhere = Releases::start("v9.0.0").await;

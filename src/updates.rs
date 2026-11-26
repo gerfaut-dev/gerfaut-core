@@ -1,7 +1,8 @@
 //! Release update check against the site, and the rule both apps follow.
 //!
 //! Read-only: one request for the file the site keeps for the app,
-//! [`RELEASES_SITE`] and [`ReleaseFeed`], which sends the version in no
+//! `https://gerfaut-wallet.com/releases/` and the name of its
+//! [`ReleaseFeed`], which sends the version in no
 //! way and nothing about the wallets. The apps run it from a button, and
 //! on their own at most once a day unless the user turned that off.
 //! Failures (offline, a file missing or unreadable) degrade to "could
@@ -317,7 +318,7 @@ pub(crate) const RELEASES_SITE: &str = "https://gerfaut-wallet.com/releases";
 /// [`RELEASES_SITE`]; in a debug build only, the address the
 /// `GERFAUT_RELEASES_SITE` variable names instead, so that a developer
 /// can see the notice against a file served on their own machine, such
-/// as `http://127.0.0.1:8765`: the variable of the running process, or
+/// as `http://127.0.0.1:8765/releases`: the variable of the running process, or
 /// else the one the build saw, since an Android app is started with no
 /// variable of ours. A release build reads neither: its check goes to
 /// the site and nowhere else.
@@ -326,6 +327,7 @@ pub(crate) fn releases_site() -> std::borrow::Cow<'static, str> {
     if let Some(site) = std::env::var("GERFAUT_RELEASES_SITE")
         .ok()
         .or_else(|| option_env!("GERFAUT_RELEASES_SITE").map(str::to_owned))
+        .map(|site| site.trim_end_matches('/').to_owned())
         .filter(|site| !site.is_empty())
     {
         return site.into();
@@ -781,5 +783,43 @@ mod tests {
                 tor_unavailable: false,
             }
         );
+    }
+
+    /// Live. The site answers each file with a version, as the check
+    /// asks for it. Ignored: it needs the network.
+    #[tokio::test]
+    #[ignore = "talks to the site"]
+    async fn the_site_answers_each_file() {
+        for feed in [ReleaseFeed::Desktop, ReleaseFeed::Android] {
+            let tag = latest_tag(RELEASES_SITE, feed, None)
+                .await
+                .unwrap_or_else(|error| panic!("{} answers: {error}", feed.file()));
+            assert!(Version::parse(&tag).is_some(), "{tag}");
+        }
+    }
+
+    /// Live. The site answers through Tor too, the route of a wallet
+    /// with an onion node: a host that turned exits away would leave
+    /// those wallets without a notice, silently. Ignored: it bootstraps
+    /// the embedded client, which takes up to a minute.
+    #[cfg(feature = "embedded-tor")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "bootstraps Tor and talks to the site"]
+    async fn the_site_answers_through_tor() {
+        use crate::chain::tor::{TorMode, TorSettings};
+        let dir = tempfile::tempdir().unwrap();
+        let settings = TorSettings {
+            mode: TorMode::Embedded,
+            socks_proxy: None,
+        };
+        let route = crate::chain::tor::resolve(&settings, dir.path())
+            .await
+            .expect("the embedded client bootstraps");
+        for feed in [ReleaseFeed::Desktop, ReleaseFeed::Android] {
+            let tag = latest_tag(RELEASES_SITE, feed, Some(&route.proxy()))
+                .await
+                .unwrap_or_else(|error| panic!("{} answers over Tor: {error}", feed.file()));
+            assert!(Version::parse(&tag).is_some(), "{tag}");
+        }
     }
 }
