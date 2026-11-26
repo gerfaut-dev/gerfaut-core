@@ -422,8 +422,32 @@ pub(crate) fn onion_handshake<S: Read + Write>(
         .map_err(|e| ConnectError::Io(e.to_string()))?;
     session
         .complete_io(&mut socket)
-        .map_err(|e| ConnectError::Unreachable(format!("TLS handshake failed: {e}")))?;
+        .map_err(|e| ConnectError::Unreachable(handshake_failed(&e)))?;
     Ok(rustls::StreamOwned::new(session, socket))
+}
+
+/// What a handshake that failed says, for reasons other than the
+/// certificate. An answer that is no TLS record at all is most often a
+/// server that speaks in the clear on that port: that is said in words,
+/// the library's own ("corrupt message of type InvalidContentType")
+/// telling the person nothing they can act on.
+pub(crate) fn handshake_failed(error: &std::io::Error) -> String {
+    let not_tls = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+        .is_some_and(|inner| {
+            matches!(
+                inner,
+                rustls::Error::InvalidMessage(rustls::InvalidMessage::InvalidContentType)
+            )
+        });
+    if not_tls {
+        "TLS handshake failed: the server answered without TLS. This port may not use TLS: \
+         turn TLS off, or use the server's TLS port"
+            .to_owned()
+    } else {
+        format!("TLS handshake failed: {error}")
+    }
 }
 
 /// What one TLS connection to an Electrum server is opened with: the
@@ -469,12 +493,12 @@ impl Handshake {
     /// Why the handshake failed: what the verifier concluded about the
     /// certificate when that is the reason; otherwise a server that cut
     /// the opening short, an outage as it is over Tor and over Esplora.
-    pub(crate) fn refusal(&self, error: &dyn std::fmt::Display) -> ConnectError {
+    pub(crate) fn refusal(&self, error: &std::io::Error) -> ConnectError {
         match self.verifier.verdict.lock().ok().and_then(|v| v.clone()) {
             Some(verdict @ (Verdict::Unknown { .. } | Verdict::Changed { .. })) => {
                 ConnectError::Certificate(verdict)
             }
-            _ => ConnectError::Unreachable(format!("TLS handshake failed: {error}")),
+            _ => ConnectError::Unreachable(handshake_failed(error)),
         }
     }
 }
@@ -773,6 +797,29 @@ mod tests {
         let error = tcp_connect("127.0.0.1", port, Duration::from_secs(2)).unwrap_err();
         assert!(matches!(error, ConnectError::Unreachable(_)), "{error}");
         assert!(Fault::from(error).is_outage());
+    }
+
+    /// An Electrum server in the clear behind a TLS address answers the
+    /// handshake with a line of JSON: the failure says the port may not
+    /// use TLS, not the library's name for a record it cannot read.
+    #[test]
+    fn a_server_in_the_clear_says_the_port_may_not_use_tls() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut hello = [0u8; 512];
+            let _ = stream.read(&mut hello);
+            let _ = stream.write_all(b"{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700}}\n");
+            // Held until the client has read the answer and gone.
+            let _ = stream.read(&mut hello);
+        });
+        let error = connect("127.0.0.1", port, None, Duration::from_secs(5)).unwrap_err();
+        let said = error.to_string();
+        assert!(said.contains("may not use TLS"), "{said}");
+        assert!(!said.contains("InvalidContentType"), "{said}");
+        assert!(Fault::from(error).is_outage());
+        server.join().unwrap();
     }
 
     /// A name that does not resolve is a server out of reach, not a

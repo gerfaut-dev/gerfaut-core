@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- An Electrum server that answers in the clear on a port saved with TLS makes a sync fail with "the server answered without TLS. This port may not use TLS: turn TLS off, or use the server's TLS port". It used to fail with the TLS library's own words, "received corrupt message of type InvalidContentType".
 - A wallet removed from the device takes with it everything the core kept that names it. Besides its record and what was announced of it, the transactions this app broadcast that touch it go, even one that also touches another wallet: one that pays or spends one of its addresses, or that its history holds. The app preferences lose its identifier, and the session forgets what it proved of its addresses and what the live watch heard of them. A spend of the same key or witness script nested in P2SH (`sh(wpkh)`, `sh(wsh)`) belongs to another wallet, and stays.
 - `WalletManager::notices` and `notices_of` say nothing of a wallet removed since its news was claimed, and count nothing for it. A transaction an app still held for it used to be posted after the removal, under the app's name and with its amount. Both are now `async`: they read the vault.
 - A PSBT input whose final scriptSig or witness is present but empty reads as unsigned. It used to count as finalized, so the preview could call a transaction ready that no node would take.

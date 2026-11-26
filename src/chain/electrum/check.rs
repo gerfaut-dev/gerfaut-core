@@ -192,7 +192,7 @@ impl Way<'_> {
                 )
                 .await
                 .map_err(|_| Opened::NoHandshake(self.handshake_timeout()))?
-                .map_err(|e| Opened::NoHandshake(format!("TLS handshake failed: {e}")))
+                .map_err(|e| Opened::NoHandshake(tls::handshake_failed(&e)))
             } else {
                 let checked = tls::Handshake::new(pin).map_err(failed)?;
                 match tokio::time::timeout(
