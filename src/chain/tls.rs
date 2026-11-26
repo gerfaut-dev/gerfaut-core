@@ -443,7 +443,7 @@ pub(crate) fn handshake_failed(error: &std::io::Error) -> String {
         });
     if not_tls {
         "TLS handshake failed: the server answered without TLS. This port may not use TLS: \
-         turn TLS off, or use the server's TLS port"
+         use the server's TLS port, or turn TLS off if it has none"
             .to_owned()
     } else {
         format!("TLS handshake failed: {error}")
