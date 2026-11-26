@@ -17,6 +17,33 @@ use serde::{Deserialize, Serialize};
 use crate::error::{CoreError, CoreResult};
 use crate::now_secs;
 
+mod keeper;
+
+pub(crate) use keeper::{Failure, PriceKeeper};
+pub use keeper::{
+    KEEP_SECS, MAX_BACKOFF_SECS, MAX_RETRY_AFTER_SECS, PriceReading, PriceTrouble, TroubleKind,
+    backoff_secs,
+};
+
+/// Where each source answers. The public hosts, except in tests, which
+/// put a server of their own in their place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Endpoints {
+    /// Base of CoinGecko's API, up to `/api/v3`.
+    pub coingecko: String,
+    /// Base of mempool.space's API, up to `/api/v1`.
+    pub mempool: String,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Endpoints {
+            coingecko: "https://api.coingecko.com/api/v3".to_owned(),
+            mempool: "https://mempool.space/api/v1".to_owned(),
+        }
+    }
+}
+
 /// Where the quote comes from. All endpoints are public and keyless.
 ///
 /// Kraken was a source until its terms were read again: they forbid a
@@ -218,9 +245,14 @@ pub struct PriceTable {
     pub currencies: Vec<CurrencyEntry>,
     /// Every source, in display order.
     pub sources: Vec<SourceEntry>,
-    /// Seconds from one price to the next while the fiat value is on,
-    /// and from a failure to the next try: [`REFRESH_SECS`].
+    /// Seconds from one price to the next while the fiat value is on:
+    /// [`REFRESH_SECS`]. A source that fails is asked less often than
+    /// that, whatever the apps ask ([`PriceReading`]).
     pub refresh_secs: u64,
+    /// Seconds a price stands in while its source fails
+    /// ([`KEEP_SECS`]): a chart an app keeps after a failed refresh is
+    /// held no longer either.
+    pub keep_secs: u64,
 }
 
 /// One currency of the [`PriceTable`].
@@ -291,6 +323,7 @@ pub fn price_table() -> PriceTable {
             })
             .collect(),
         refresh_secs: REFRESH_SECS,
+        keep_secs: KEEP_SECS,
     }
 }
 
@@ -324,30 +357,63 @@ pub(crate) fn client_through(proxy: Option<&str>) -> CoreResult<reqwest::Client>
         .map_err(|e| CoreError::Internal(format!("http client: {e}")))
 }
 
-/// One GET for a JSON answer, through `proxy` when there is one.
-async fn get_json(url: &str, proxy: Option<&str>) -> CoreResult<serde_json::Value> {
-    let mut response = client_through(proxy)?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| price_error(e.to_string()))?;
-    if !response.status().is_success() {
-        return Err(price_error(format!("http {}", response.status())));
+/// One GET for a JSON answer, through `proxy` when there is one. A
+/// failure says what kind it is, which is what decides how long the
+/// source is left alone.
+async fn get_json(url: &str, proxy: Option<&str>) -> Result<serde_json::Value, Failure> {
+    let client = client_through(proxy).map_err(|e| refused(e.to_string()))?;
+    let mut response = client.get(url).send().await.map_err(unreachable)?;
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after =
+            crate::chain::esplora::retry_after(response.headers()).map(|wait| wait.as_secs());
+        let kind = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            TroubleKind::RateLimited
+        } else if status.is_server_error() {
+            TroubleKind::Unreachable
+        } else {
+            TroubleKind::Refused
+        };
+        return Err(Failure {
+            kind,
+            retry_after,
+            detail: format!("http {status}"),
+        });
     }
     // Read a chunk at a time, once decompressed: a small gzip of a huge
     // body is cut off, not held whole.
     let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| price_error(e.to_string()))?
-    {
+    while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
         if body.len() + chunk.len() > MAX_ANSWER {
-            return Err(price_error("the answer is far too large".to_owned()));
+            return Err(refused("the answer is far too large".to_owned()));
         }
         body.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&body).map_err(|e| price_error(e.to_string()))
+    serde_json::from_slice(&body).map_err(|e| refused(e.to_string()))
+}
+
+/// No answer: no connection, or none in time.
+fn unreachable(error: reqwest::Error) -> Failure {
+    Failure {
+        kind: TroubleKind::Unreachable,
+        retry_after: None,
+        detail: error.to_string(),
+    }
+}
+
+/// An answer that is no price.
+fn refused(detail: String) -> Failure {
+    Failure {
+        kind: TroubleKind::Refused,
+        retry_after: None,
+        detail,
+    }
+}
+
+impl From<Failure> for CoreError {
+    fn from(failure: Failure) -> Self {
+        price_error(failure.detail)
+    }
 }
 
 /// Largest price answer read: the whole history mempool.space serves in
@@ -359,6 +425,14 @@ fn price_error(detail: String) -> CoreError {
         backend: "price".to_owned(),
         detail,
     }
+}
+
+/// A request not sent: the source asked to be left alone until `until`.
+pub(crate) fn waiting_error(source: PriceSource, until: u64) -> CoreError {
+    price_error(format!(
+        "{} asked to wait until {until}: nothing sent",
+        source.label()
+    ))
 }
 
 /// Refuses a currency the source does not quote, before anything is
@@ -398,31 +472,30 @@ pub(crate) async fn fetch_price(
     source: PriceSource,
     currency: FiatCurrency,
     proxy: Option<&str>,
-) -> CoreResult<PriceQuote> {
-    check_quote(source, currency)?;
+    endpoints: &Endpoints,
+) -> Result<PriceQuote, Failure> {
+    check_quote(source, currency).map_err(|e| refused(e.to_string()))?;
+    let shape = || refused("unexpected response shape".to_owned());
     let rate = match source {
         PriceSource::Coingecko => {
             let code = currency.code().to_lowercase();
             let value = get_json(
                 &format!(
-                    "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies={code}"
+                    "{}/simple/price?ids=bitcoin&vs_currencies={code}",
+                    endpoints.coingecko
                 ),
                 proxy,
             )
             .await?;
-            value["bitcoin"][&code]
-                .as_f64()
-                .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
+            value["bitcoin"][&code].as_f64().ok_or_else(shape)?
         }
         PriceSource::MempoolSpace => {
-            let value = get_json("https://mempool.space/api/v1/prices", proxy).await?;
-            value[currency.code()]
-                .as_f64()
-                .ok_or_else(|| price_error("unexpected response shape".to_owned()))?
+            let value = get_json(&format!("{}/prices", endpoints.mempool), proxy).await?;
+            value[currency.code()].as_f64().ok_or_else(shape)?
         }
     };
     if !rate.is_finite() || rate <= 0.0 {
-        return Err(price_error(format!("implausible rate {rate}")));
+        return Err(refused(format!("implausible rate {rate}")));
     }
     Ok(PriceQuote {
         rate,
@@ -465,8 +538,9 @@ pub(crate) async fn fetch_price_history(
     currency: FiatCurrency,
     range: PriceRange,
     proxy: Option<&str>,
-) -> CoreResult<PriceHistory> {
-    check_history(source, currency, range)?;
+    endpoints: &Endpoints,
+) -> Result<PriceHistory, Failure> {
+    check_history(source, currency, range).map_err(|e| refused(e.to_string()))?;
     let mut points = match source {
         PriceSource::Coingecko => {
             let days = match range {
@@ -478,16 +552,17 @@ pub(crate) async fn fetch_price_history(
             let code = currency.code().to_lowercase();
             let value = get_json(
                 &format!(
-                    "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency={code}&days={days}"
+                    "{}/coins/bitcoin/market_chart?vs_currency={code}&days={days}",
+                    endpoints.coingecko
                 ),
                 proxy,
             )
             .await?;
-            parse_coingecko_history(&value)?
+            parse_coingecko_history(&value).map_err(|e| refused(e.to_string()))?
         }
         PriceSource::MempoolSpace => {
-            let series = mempool_series(currency, proxy).await?;
-            let now = fetch_price(source, currency, proxy).await.ok();
+            let series = mempool_series(currency, proxy, endpoints).await?;
+            let now = fetch_price(source, currency, proxy, endpoints).await.ok();
             closed_by(&series, now.as_ref())
         }
     };
@@ -501,7 +576,7 @@ pub(crate) async fn fetch_price_history(
     }
     let points = thin_series(points, MAX_POINTS);
     if points.len() < 2 {
-        return Err(price_error("not enough points for a chart".to_owned()));
+        return Err(refused("not enough points for a chart".to_owned()));
     }
     Ok(PriceHistory {
         points,
@@ -577,13 +652,19 @@ impl SeriesCache {
 
 /// mempool.space's whole series in `currency`, from the cache while it
 /// holds, else asked and kept.
-async fn mempool_series(currency: FiatCurrency, proxy: Option<&str>) -> CoreResult<Series> {
+async fn mempool_series(
+    currency: FiatCurrency,
+    proxy: Option<&str>,
+    endpoints: &Endpoints,
+) -> Result<Series, Failure> {
     let now = now_secs();
     if let Some(series) = MEMPOOL_SERIES.fresh(currency, now) {
         return Ok(series);
     }
-    let value = get_json(&mempool_history_url(currency), proxy).await?;
-    let series = std::sync::Arc::new(parse_mempool_history(&value, currency)?);
+    let value = get_json(&mempool_history_url(&endpoints.mempool, currency), proxy).await?;
+    let series = std::sync::Arc::new(
+        parse_mempool_history(&value, currency).map_err(|e| refused(e.to_string()))?,
+    );
     MEMPOOL_SERIES.keep(currency, now, series.clone());
     Ok(series)
 }
@@ -605,11 +686,8 @@ fn closed_by(series: &[PricePoint], now: Option<&PriceQuote>) -> Vec<PricePoint>
 /// mempool.space's whole history in the one currency on screen. With no
 /// `currency`, a documented parameter, it answers every currency it
 /// serves; with one, that currency and the dollar.
-fn mempool_history_url(currency: FiatCurrency) -> String {
-    format!(
-        "https://mempool.space/api/v1/historical-price?currency={}",
-        currency.code()
-    )
+fn mempool_history_url(base: &str, currency: FiatCurrency) -> String {
+    format!("{base}/historical-price?currency={}", currency.code())
 }
 
 /// mempool.space historical prices: `{"prices": [{"time": s, "USD": n, ...}]}`.
@@ -732,6 +810,7 @@ mod tests {
     fn the_table_is_the_one_behind_the_types() {
         let table = price_table();
         assert_eq!(table.refresh_secs, 60);
+        assert_eq!(table.keep_secs, 6 * 3600);
         let currencies: Vec<FiatCurrency> = table
             .currencies
             .iter()
@@ -809,17 +888,19 @@ mod tests {
     #[tokio::test]
     async fn a_source_refuses_a_currency_it_does_not_quote() {
         // Refused before any request goes out.
-        let error = fetch_price(PriceSource::MempoolSpace, FiatCurrency::Inr, None)
+        let public = Endpoints::default();
+        let error = fetch_price(PriceSource::MempoolSpace, FiatCurrency::Inr, None, &public)
             .await
             .unwrap_err()
-            .to_string();
+            .detail;
         assert!(error.contains("INR"), "{error}");
         assert!(
             fetch_price_history(
                 PriceSource::MempoolSpace,
                 FiatCurrency::Ngn,
                 PriceRange::Year,
-                None
+                None,
+                &public
             )
             .await
             .is_err()
@@ -906,13 +987,14 @@ mod tests {
     /// The history is asked in the currency on screen alone.
     #[test]
     fn mempool_history_asks_for_one_currency() {
+        let base = Endpoints::default().mempool;
         assert_eq!(
-            mempool_history_url(FiatCurrency::Eur),
+            mempool_history_url(&base, FiatCurrency::Eur),
             "https://mempool.space/api/v1/historical-price?currency=EUR"
         );
         for currency in FiatCurrency::ALL {
             if PriceSource::MempoolSpace.supports_currency(*currency) {
-                assert!(mempool_history_url(*currency).ends_with(currency.code()));
+                assert!(mempool_history_url(&base, *currency).ends_with(currency.code()));
             }
         }
     }
@@ -957,12 +1039,12 @@ mod tests {
         // reachable at all.
         let mut reachable = 0;
         for source in PriceSource::ALL {
-            match fetch_price(source, FiatCurrency::Eur, None).await {
+            match fetch_price(source, FiatCurrency::Eur, None, &Endpoints::default()).await {
                 Ok(quote) => {
                     reachable += 1;
                     assert!(quote.rate > 1_000.0, "{source:?} gave {}", quote.rate);
                 }
-                Err(error) => eprintln!("{source:?} unreachable: {error}"),
+                Err(error) => eprintln!("{source:?} unreachable: {error:?}"),
             }
         }
         assert!(reachable >= 1, "no price source reachable");
@@ -1021,7 +1103,15 @@ mod tests {
                 if !source.supports(range) {
                     continue;
                 }
-                match fetch_price_history(source, FiatCurrency::Usd, range, None).await {
+                match fetch_price_history(
+                    source,
+                    FiatCurrency::Usd,
+                    range,
+                    None,
+                    &Endpoints::default(),
+                )
+                .await
+                {
                     Ok(history) => {
                         reachable += 1;
                         assert!(history.points.len() >= 2, "{source:?} {range:?} too short");
@@ -1031,7 +1121,7 @@ mod tests {
                             "{source:?} {range:?} not sorted"
                         );
                     }
-                    Err(error) => eprintln!("{source:?} {range:?} unreachable: {error}"),
+                    Err(error) => eprintln!("{source:?} {range:?} unreachable: {error:?}"),
                 }
             }
         }

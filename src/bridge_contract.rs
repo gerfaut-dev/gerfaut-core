@@ -73,7 +73,7 @@ use crate::network::Network;
 use crate::prefs::{Preferences, PreferencesChange, Unit};
 use crate::price::{
     CurrencyEntry, CurrencyReach, FiatCurrency, PriceHistory, PricePoint, PriceQuote, PriceRange,
-    PriceSource, SourceEntry, price_table,
+    PriceReading, PriceSource, PriceTrouble, SourceEntry, TroubleKind, price_table,
 };
 use crate::store::{Settings, TxStage};
 use crate::updates::UpdateStatus;
@@ -2547,6 +2547,52 @@ fn prices() -> Vec<Fixture> {
             rate: 92_034.25,
         },
     ];
+    let quote = PriceQuote {
+        rate: 92_034.25,
+        currency: FiatCurrency::Eur,
+        source: PriceSource::MempoolSpace,
+        at: NOW,
+    };
+    // A rate limit just met, quiet; then a source that has not
+    // answered for ten minutes, said.
+    let quiet = PriceTrouble {
+        kind: TroubleKind::RateLimited,
+        since: NOW + 60,
+        next_try: NOW + 180,
+        lasting: false,
+    };
+    let lasting = PriceTrouble {
+        kind: TroubleKind::Unreachable,
+        since: NOW + 60,
+        next_try: NOW + 900,
+        lasting: true,
+    };
+    let readings = vec![
+        (
+            "fresh",
+            PriceReading::Fresh {
+                quote: quote.clone(),
+            },
+        ),
+        (
+            "kept",
+            PriceReading::Kept {
+                quote,
+                trouble: quiet.clone(),
+            },
+        ),
+        (
+            "missing",
+            PriceReading::Missing {
+                trouble: lasting.clone(),
+            },
+        ),
+    ];
+    reaches_every("PriceReading", &readings, 3, |reading| match reading {
+        PriceReading::Fresh { .. } => 0,
+        PriceReading::Kept { .. } => 1,
+        PriceReading::Missing { .. } => 2,
+    });
 
     vec![
         variants(
@@ -2605,6 +2651,20 @@ fn prices() -> Vec<Fixture> {
                 ),
             ],
         ),
+        variants(
+            "TroubleKind",
+            every!(TroubleKind {
+                RateLimited,
+                Unreachable,
+                Refused,
+                Tor,
+            }),
+        ),
+        fixture(
+            "PriceTrouble",
+            vec![("quiet", quiet.clone()), ("lasting", lasting.clone())],
+        ),
+        fixture("PriceReading", readings),
         variants(
             "PriceRange",
             every!(PriceRange {

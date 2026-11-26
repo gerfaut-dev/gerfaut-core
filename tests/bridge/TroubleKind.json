@@ -1,0 +1,6 @@
+{
+  "rate_limited": "rate_limited",
+  "unreachable": "unreachable",
+  "refused": "refused",
+  "tor": "tor"
+}

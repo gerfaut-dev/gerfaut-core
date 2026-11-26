@@ -1,0 +1,14 @@
+{
+  "quiet": {
+    "kind": "rate_limited",
+    "since": 1750000060,
+    "next_try": 1750000180,
+    "lasting": false
+  },
+  "lasting": {
+    "kind": "unreachable",
+    "since": 1750000060,
+    "next_try": 1750000900,
+    "lasting": true
+  }
+}

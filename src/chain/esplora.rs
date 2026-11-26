@@ -543,7 +543,7 @@ impl<B: AsRef<[u8]>> std::io::Read for ChunkReader<B> {
 /// The wait a `Retry-After` header names, in seconds or as the date to
 /// come back at, a day at most. A date already past, or written in one
 /// of the obsolete forms, reads as none: the shortest wait applies.
-fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let value = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
