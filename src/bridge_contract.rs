@@ -1354,6 +1354,7 @@ fn wallet() -> Vec<Fixture> {
                         address: address(RECEIVE, 1),
                         used: false,
                         derivation: Some("m/84'/1'/0'/0/1".to_owned()),
+                        revealed: false,
                     },
                 ),
                 (
@@ -1363,6 +1364,7 @@ fn wallet() -> Vec<Fixture> {
                         address: MAINNET_ADDRESS.to_owned(),
                         used: true,
                         derivation: None,
+                        revealed: true,
                     },
                 ),
             ],

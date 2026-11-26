@@ -959,18 +959,24 @@ const MAX_INDEX: u32 = (1 << 31) - 1;
 /// found past addresses nobody paid, is skipped rather than offered
 /// again. A descriptor with no wildcard has one address, given once.
 ///
+/// Each entry says whether it was revealed before this call: the first
+/// one that was not is an address nobody has been given yet.
+///
 /// Reveals the next unused address if needed: the caller must persist
 /// the staged change set afterwards.
 pub(crate) fn receive_addresses(
     wallet: &mut bdk_wallet::Wallet,
     lookahead: u32,
 ) -> Vec<AddressEntry> {
+    let last_revealed = wallet.derivation_index(KeychainKind::External);
+    let revealed = |index: u32| last_revealed.is_some_and(|last| index <= last);
     let next = wallet.next_unused_address(KeychainKind::External);
     let mut entries = vec![AddressEntry {
         index: next.index,
         address: next.address.to_string(),
         used: false,
         derivation: derivation_path(wallet, next.index),
+        revealed: revealed(next.index),
     }];
     if !wallet
         .public_descriptor(KeychainKind::External)
@@ -997,6 +1003,7 @@ pub(crate) fn receive_addresses(
             address: peeked.address.to_string(),
             used: false,
             derivation: derivation_path(wallet, peeked.index),
+            revealed: revealed(peeked.index),
         });
     }
     entries
@@ -1237,6 +1244,49 @@ mod tests {
         .create_wallet_no_persist()
         .unwrap();
         assert_eq!(receive_addresses(&mut single, 5).len(), 1);
+    }
+
+    /// The page starts at the oldest unused address, often one handed
+    /// out long ago; the first address past all those handed out is
+    /// told apart, for an address nobody has been given yet.
+    #[test]
+    fn receive_addresses_tell_the_ones_handed_out_before() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            Amount, OutPoint, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        // A first visit: the address it shows was never shown before.
+        let first = receive_addresses(&mut wallet, 1);
+        assert_eq!(first[0].index, 0);
+        assert!(!first[0].revealed);
+        // The next visit shows it again, now as handed out.
+        assert!(receive_addresses(&mut wallet, 0)[0].revealed);
+
+        // Indexes 1 and 3 are paid, 0 and 2 stay empty.
+        let payments = [1u32, 3].map(|index| Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([index as u8; 32]), 0),
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: wallet
+                    .peek_address(KeychainKind::External, index)
+                    .script_pubkey(),
+            }],
+        });
+        wallet.apply_unconfirmed_txs(payments.map(|tx| (tx, 1_700_000_000)));
+
+        let entries = receive_addresses(&mut wallet, 3);
+        let seen: Vec<(u32, bool)> = entries.iter().map(|e| (e.index, e.revealed)).collect();
+        assert_eq!(seen, [(0, true), (2, true), (4, false), (5, false)]);
     }
 
     /// A payment is worth two words: when it shows up, and when a block

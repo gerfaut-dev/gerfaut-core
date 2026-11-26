@@ -353,6 +353,7 @@ impl WalletManager {
                     .as_ref()
                     .is_some_and(|s| !s.txs.is_empty()),
                 derivation: None,
+                revealed: true,
             }]),
         }
     }
