@@ -170,6 +170,11 @@ pub struct AddressEntry {
     /// keychain-relative (`0/5`). None for watched single addresses.
     #[serde(default)]
     pub derivation: Option<String>,
+    /// Handed out before this view: revealed by an earlier Receive page
+    /// or by a sync, used or not. The first address that is not has
+    /// never been shown to anyone. A watched single address always is.
+    #[serde(default)]
+    pub revealed: bool,
 }
 
 /// Home view of a wallet: metadata, balance, transaction list.

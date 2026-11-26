@@ -345,16 +345,30 @@ impl WalletManager {
                 }
                 Ok(entries)
             }
-            WalletKind::SingleAddress { address } => Ok(vec![AddressEntry {
-                index: 0,
-                address: address.clone(),
-                used: record
-                    .address_state
-                    .as_ref()
-                    .is_some_and(|s| !s.txs.is_empty()),
-                derivation: None,
-            }]),
+            WalletKind::SingleAddress { address } => {
+                Ok(vec![single_address_entry(&record, address)])
+            }
         }
+    }
+
+    /// Keeps every receive address up to `index` revealed: the receive
+    /// page shows it, so it counts as handed out, a sync watches it, and
+    /// "New address" never offers it again. A single-address wallet has
+    /// nothing to reveal.
+    pub async fn reveal_receive_address(&self, id: &str, index: u32) -> CoreResult<()> {
+        let mut state = self.state.lock().await;
+        let record = find_record(&state.payload, id)?.clone();
+        if let WalletKind::Descriptors { .. } = &record.meta.kind {
+            let engine = ensure_engine(&mut state, id)?;
+            views::reveal_receive_address(engine, index)?;
+            let staged = engine.take_staged();
+            if let Some(staged) = staged {
+                merge_changeset(&mut state, id, staged)?;
+                let state = &mut *state;
+                state.vault.save(&state.payload)?;
+            }
+        }
+        Ok(())
     }
 
     /// Revealed addresses of a wallet, by keychain, with usage and the
@@ -404,6 +418,21 @@ impl WalletManager {
     ) -> CoreResult<ExportResult> {
         let snapshot = self.wallet_snapshot(id).await?;
         Ok(crate::export::transactions_csv(&snapshot.txs, options))
+    }
+}
+
+/// The one address of a single-address wallet, as the receive page
+/// lists it: given out from the start.
+fn single_address_entry(record: &WalletRecord, address: &str) -> AddressEntry {
+    AddressEntry {
+        index: 0,
+        address: address.to_owned(),
+        used: record
+            .address_state
+            .as_ref()
+            .is_some_and(|s| !s.txs.is_empty()),
+        derivation: None,
+        revealed: true,
     }
 }
 
