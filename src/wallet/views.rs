@@ -1322,6 +1322,47 @@ mod tests {
         assert_eq!(seen, [(0, true), (2, true), (4, false), (5, false)]);
     }
 
+    /// The receive page offers the first address nobody paid, shown
+    /// before or not: once a payment to it shows up, still in the
+    /// mempool, it is no longer offered at all.
+    #[test]
+    fn the_address_on_offer_gives_way_to_a_mempool_payment() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            Amount, OutPoint, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let shown = receive_addresses(&mut wallet, 1);
+        reveal_receive_address(&mut wallet, 1).unwrap();
+        // Shown before, so told apart, but still the one on offer.
+        let again = receive_addresses(&mut wallet, 1);
+        assert_eq!((again[0].index, again[0].revealed), (0, true));
+
+        let payment = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: wallet
+                    .peek_address(KeychainKind::External, 0)
+                    .script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(payment, 1_700_000_000)]);
+
+        let after = receive_addresses(&mut wallet, 3);
+        assert_eq!((after[0].index, after[0].revealed), (1, true));
+        assert!(after.iter().all(|e| e.address != shown[0].address));
+    }
+
     /// A payment is worth two words: when it shows up, and when a block
     /// takes it. The first sync lists it as new and pending, the one
     /// that finds it in a block lists it as confirmed, and neither
