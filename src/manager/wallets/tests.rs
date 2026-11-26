@@ -145,6 +145,79 @@ async fn receive_addresses_derive_and_persist() {
     assert_eq!(again[0].address, entries[0].address);
 }
 
+/// An address the receive page shows counts as handed out from then on,
+/// after a restart too, whether "Next address" or "New address" brought
+/// it there: the first address not revealed is one nobody was shown.
+#[tokio::test]
+async fn a_shown_receive_address_stays_handed_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Signet cold", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let first = manager.receive_addresses(&meta.id, 3).await.unwrap();
+    assert_eq!(first[0].index, 0);
+    assert!(!first[2].revealed);
+
+    // The page moved to index 2 and showed it.
+    manager.reveal_receive_address(&meta.id, 2).await.unwrap();
+
+    drop(manager);
+    let manager = WalletManager::open(dir.path(), key()).unwrap();
+    let listed = manager.receive_addresses(&meta.id, 4).await.unwrap();
+    let revealed: Vec<(u32, bool)> = listed.iter().map(|e| (e.index, e.revealed)).collect();
+    assert_eq!(
+        revealed,
+        [(0, true), (1, true), (2, true), (3, false), (4, false)]
+    );
+    // The addresses themselves are the ones shown before.
+    assert_eq!(listed[2].address, first[2].address);
+
+    // Showing one again changes nothing.
+    manager.reveal_receive_address(&meta.id, 1).await.unwrap();
+    let again = manager.receive_addresses(&meta.id, 4).await.unwrap();
+    assert!(!again[3].revealed);
+}
+
+/// The page never shows an index past its reach: one asked for is a
+/// mistake, refused rather than revealing thousands of addresses.
+#[tokio::test]
+async fn a_receive_address_past_the_page_reach_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Signet cold", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let _ = manager.receive_addresses(&meta.id, 0).await.unwrap();
+    let err = manager
+        .reveal_receive_address(&meta.id, 5_000)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("past the addresses"), "{err}");
+    let listed = manager.receive_addresses(&meta.id, 1).await.unwrap();
+    assert!(!listed[1].revealed);
+}
+
+#[tokio::test]
+async fn a_watched_address_has_nothing_to_reveal() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let address = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+    let parsed = parse_input(address).unwrap();
+    let meta = manager
+        .add_wallet("Watched address", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    manager.reveal_receive_address(&meta.id, 0).await.unwrap();
+    let listed = manager.receive_addresses(&meta.id, 0).await.unwrap();
+    assert_eq!(listed[0].address, address);
+    assert!(listed[0].revealed);
+}
+
 #[tokio::test]
 async fn address_list_and_export_read_the_same_state() {
     let dir = tempfile::tempdir().unwrap();

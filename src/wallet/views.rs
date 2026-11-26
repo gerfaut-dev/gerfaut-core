@@ -1009,6 +1009,39 @@ pub(crate) fn receive_addresses(
     entries
 }
 
+/// Reveals every receive address up to `index`, the one the receive
+/// page shows: shown, an address counts as handed out, a sync watches
+/// it, and [`receive_addresses`] says so from then on. An address
+/// already revealed changes nothing.
+///
+/// Refuses an index [`receive_addresses`] could not have handed out:
+/// past the last revealed one by more than its reach, or any index but
+/// 0 for a descriptor with no wildcard.
+///
+/// The caller must persist the staged change set afterwards.
+pub(crate) fn reveal_receive_address(
+    wallet: &mut bdk_wallet::Wallet,
+    index: u32,
+) -> CoreResult<()> {
+    let wildcard = wallet
+        .public_descriptor(KeychainKind::External)
+        .has_wildcard();
+    let next = wallet
+        .derivation_index(KeychainKind::External)
+        .map_or(0, |last| last.saturating_add(1));
+    let reach = next.saturating_add(MAX_LOOKAHEAD).min(MAX_INDEX);
+    if (!wildcard && index != 0) || index > reach {
+        return Err(CoreError::InvalidInput {
+            kind: "receive address",
+            detail: format!("index {index} is past the addresses the receive page shows"),
+        });
+    }
+    // Revealed as soon as it is called: the addresses it yields are not
+    // needed.
+    let _ = wallet.reveal_addresses_to(KeychainKind::External, index);
+    Ok(())
+}
+
 /// Absolute derivation path of one external address, when the
 /// descriptor carries a single unambiguous origin (`m/84'/1'/0'/0/5`).
 /// Multi-key descriptors with diverging origins fall back to the
