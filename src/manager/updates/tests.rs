@@ -1,5 +1,5 @@
-//! The update check against a releases API that lives in the test, on
-//! a vault on disk, with a clock the test moves by hand.
+//! The update check against a site that lives in the test, on a vault
+//! on disk, with a clock the test moves by hand.
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -13,33 +13,38 @@ use crate::chain::tor::{TorMode, TorSettings, socks};
 use crate::manager::tests::support::{closed_port, manager as open};
 use crate::network::Network;
 
-const REPO: &str = "gerfaut-wallet/gerfaut-desktop";
+const FEED: ReleaseFeed = ReleaseFeed::Desktop;
 const DAY: u64 = crate::updates::CHECK_EVERY;
 const NOW: u64 = 1_800_000_000;
 const ONION: &str = "tcp://gerfautexample000000000000000000000000000000000000000.onion:50001";
 
-/// Something that answers like the releases API: the tag a test sets,
-/// or a failure when it sets none, and counts who came. Gone, it
-/// answers `410 Gone` to a request that names the API version, or to
-/// every request.
+/// Something that answers like the site: the file of a release whose
+/// tag a test sets, a failure, a body of the test's choosing, or
+/// nothing at all; and counts who came.
 struct Releases {
-    api: String,
+    site: String,
     visits: Arc<Mutex<u32>>,
-    tag: Arc<Mutex<Option<String>>>,
+    answer: Arc<Mutex<Answer>>,
     /// The head of each request, lowercased, in the order they came.
     heads: Arc<Mutex<Vec<String>>>,
-    gone: Arc<Mutex<Option<Gone>>>,
 }
 
-/// What the releases API answers `410 Gone` to.
-#[derive(Clone, Copy)]
-enum Gone {
-    /// A request that names the API version; the others hang.
-    VersionedAndStall,
-    /// A request that names the API version.
-    Versioned,
-    /// Every request.
-    Every,
+/// What the site answers.
+#[derive(Clone)]
+enum Answer {
+    /// `200` and `{"tag_name": …}`, with an address beside it that no
+    /// app ever opens.
+    Tag(String),
+    /// `200` and this body, whatever it is.
+    Body(String),
+    /// `404`, the file not there.
+    Missing,
+    /// `503`.
+    Fail,
+    /// `302` to this address.
+    Redirect(String),
+    /// Holds the connection, answering nothing.
+    Stall,
 }
 
 impl Releases {
@@ -47,11 +52,9 @@ impl Releases {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let visits = Arc::new(Mutex::new(0u32));
-        let tag = Arc::new(Mutex::new(Some(tag.to_owned())));
+        let answer = Arc::new(Mutex::new(Answer::Tag(tag.to_owned())));
         let heads: Arc<Mutex<Vec<String>>> = Arc::default();
-        let gone: Arc<Mutex<Option<Gone>>> = Arc::default();
-        let (counted, answered, seen, going) =
-            (visits.clone(), tag.clone(), heads.clone(), gone.clone());
+        let (counted, answering, seen) = (visits.clone(), answer.clone(), heads.clone());
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 *counted.lock().unwrap() += 1;
@@ -65,73 +68,64 @@ impl Releases {
                         Ok(read) => request.extend_from_slice(&chunk[..read]),
                     }
                 }
-                let head = String::from_utf8_lossy(&request).to_lowercase();
-                let versioned = head.contains("\r\nx-github-api-version:");
-                seen.lock().unwrap().push(head);
-                let gone = match *going.lock().unwrap() {
-                    Some(Gone::Every) => true,
-                    Some(Gone::Versioned | Gone::VersionedAndStall) => versioned,
-                    None => false,
-                };
-                if gone {
-                    let body = r#"{"message":"Gone","status":"410"}"#;
-                    let answer = format!(
-                        "HTTP/1.1 410 Gone\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(answer.as_bytes()).await;
-                    continue;
-                }
-                if matches!(*going.lock().unwrap(), Some(Gone::VersionedAndStall)) {
-                    // Holds the connection, answering nothing.
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                        drop(stream);
-                    });
-                    continue;
-                }
-                let tag = answered.lock().unwrap().clone();
-                let answer = match tag {
-                    // The page it names is never the one an app opens.
-                    Some(tag) => {
-                        let body = format!(
-                            r#"{{"tag_name":"{tag}","html_url":"https://evil.example/download"}}"#
-                        );
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_lowercase());
+                let answer = answering.lock().unwrap().clone();
+                let (status, body) = match answer {
+                    Answer::Tag(tag) => (
+                        "200 OK",
                         format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        )
+                            r#"{{"tag_name":"{tag}","html_url":"https://evil.example/download"}}"#
+                        ),
+                    ),
+                    Answer::Body(body) => ("200 OK", body),
+                    Answer::Missing => ("404 Not Found", "<h1>Not found</h1>".to_owned()),
+                    Answer::Fail => ("503 Service Unavailable", String::new()),
+                    Answer::Redirect(to) => {
+                        let answer = format!(
+                            "HTTP/1.1 302 Found\r\nLocation: {to}\r\n\
+                             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        let _ = stream.write_all(answer.as_bytes()).await;
+                        continue;
                     }
-                    None => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\
-                             Connection: close\r\n\r\n"
-                        .to_owned(),
+                    Answer::Stall => {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                            drop(stream);
+                        });
+                        continue;
+                    }
                 };
+                let answer = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
                 let _ = stream.write_all(answer.as_bytes()).await;
             }
         });
         Releases {
-            api: format!("http://{address}"),
+            site: format!("http://{address}"),
             visits,
-            tag,
+            answer,
             heads,
-            gone,
         }
-    }
-
-    /// From now on, what `gone` names is answered `410 Gone`.
-    fn gone(&self, gone: Gone) {
-        *self.gone.lock().unwrap() = Some(gone);
     }
 
     fn heads(&self) -> Vec<String> {
         self.heads.lock().unwrap().clone()
     }
 
+    /// What the next answers are.
+    fn serve(&self, answer: Answer) {
+        *self.answer.lock().unwrap() = answer;
+    }
+
     /// What the next answers say; `None` makes them fail.
     fn answer(&self, tag: Option<&str>) {
-        *self.tag.lock().unwrap() = tag.map(str::to_owned);
+        self.serve(tag.map_or(Answer::Fail, |tag| Answer::Tag(tag.to_owned())));
     }
 
     fn visits(&self) -> u32 {
@@ -140,12 +134,12 @@ impl Releases {
 
     async fn session(&self, manager: &WalletManager, running: &str, now: u64) -> UpdateStatus {
         manager
-            .update_session_at(&self.api, REPO, running, now)
+            .update_session_at(&self.site, FEED, running, now)
             .await
     }
 
     async fn button(&self, manager: &WalletManager, running: &str) -> CoreResult<UpdateStatus> {
-        manager.check_update_at(&self.api, REPO, running).await
+        manager.check_update_at(&self.site, FEED, running).await
     }
 }
 
@@ -199,89 +193,146 @@ async fn the_first_day_asks_nothing_and_the_next_one_does() {
     assert_eq!(manager.update_status("0.1.0").await, status);
 }
 
-/// The check names the version of the REST API it is written against,
-/// as GitHub's documentation asks, beside its name and the JSON it takes.
+/// Each app asks for its own file on the site, and the request carries
+/// nothing but itself: no version, no cookie, no header beyond what any
+/// HTTP request has.
 #[tokio::test]
-async fn the_check_names_the_api_version() {
+async fn each_app_asks_for_its_own_file_and_says_nothing_else() {
     let releases = Releases::start("v0.2.0").await;
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
-    releases.button(&manager, "0.1.0").await.unwrap();
+    let desktop = manager
+        .check_update_at(&releases.site, ReleaseFeed::Desktop, "0.1.0")
+        .await
+        .unwrap();
+    let android = manager
+        .check_update_at(&releases.site, ReleaseFeed::Android, "0.1.0")
+        .await
+        .unwrap();
+    assert_eq!(desktop.available.as_deref(), Some("0.2.0"));
+    assert_eq!(android.available.as_deref(), Some("0.2.0"));
 
     let heads = releases.heads();
-    assert_eq!(heads.len(), 1);
-    let head = &heads[0];
-    assert!(
-        head.starts_with(&format!(
-            "get /repos/{}/releases/latest ",
-            REPO.to_lowercase()
-        )),
-        "{head}"
-    );
-    assert!(
-        head.contains(&format!(
-            "\r\nx-github-api-version: {}\r\n",
-            crate::updates::GITHUB_API_VERSION
-        )),
-        "{head}"
-    );
-    assert!(head.contains("\r\nuser-agent: gerfaut\r\n"), "{head}");
-    assert!(
-        head.contains("\r\naccept: application/vnd.github+json\r\n"),
-        "{head}"
-    );
+    assert_eq!(heads.len(), 2);
+    assert!(heads[0].starts_with("get /desktop.json "), "{}", heads[0]);
+    assert!(heads[1].starts_with("get /android.json "), "{}", heads[1]);
+    for head in &heads {
+        let names: Vec<&str> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':').map(|(name, _)| name))
+            .collect();
+        for name in &names {
+            assert!(
+                ["host", "user-agent", "accept", "accept-encoding"].contains(name),
+                "{name} in {head}"
+            );
+        }
+        assert!(head.contains("\r\nuser-agent: gerfaut\r\n"), "{head}");
+        assert!(!head.contains("0.1.0"), "the version stays home: {head}");
+    }
 }
 
-/// A version GitHub stopped supporting does not end the checks of an
-/// install that went without updates: it asks again without naming one.
+/// Whatever goes wrong with the file, nothing is announced, the button
+/// says it could not check, and the day counts: no second request
+/// before tomorrow.
 #[tokio::test]
-async fn a_retired_api_version_asks_again_without_one() {
-    let releases = Releases::start("v0.2.0").await;
-    releases.gone(Gone::Versioned);
+async fn a_file_missing_or_unreadable_finds_nothing_and_the_day_counts() {
+    let oversized = format!(r#"{{"tag_name":"v9.0.0","pad":"{}"}}"#, "x".repeat(20_000));
+    for answer in [
+        Answer::Missing,
+        Answer::Fail,
+        Answer::Body("<!doctype html><title>Gerfaut</title>".to_owned()),
+        Answer::Body("{}".to_owned()),
+        Answer::Body(r#"{"tag_name":9}"#.to_owned()),
+        Answer::Body(r#"{"tag_name":"v9.0.0 <b>"}"#.to_owned()),
+        Answer::Body(oversized),
+    ] {
+        let releases = Releases::start("v0.2.0").await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = opened_yesterday(dir.path(), &releases).await;
+        releases.serve(answer);
+
+        let status = releases.session(&manager, "0.1.0", NOW).await;
+        assert_eq!(status.announce, None);
+        assert_eq!(status.available, None);
+        assert_eq!(releases.visits(), 1);
+        releases.session(&manager, "0.1.0", NOW + 3600).await;
+        assert_eq!(releases.visits(), 1, "the day counts");
+        assert!(matches!(
+            releases.button(&manager, "0.1.0").await,
+            Err(CoreError::Sync { .. })
+        ));
+    }
+}
+
+/// A tag that is no version is an answer that names no release: nothing
+/// to offer, and the button still went through.
+#[tokio::test]
+async fn a_tag_that_is_no_version_offers_nothing() {
+    let releases = Releases::start("nightly").await;
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
-
     let status = releases.button(&manager, "0.1.0").await.unwrap();
-    assert_eq!(status.available.as_deref(), Some("0.2.0"));
-    let heads = releases.heads();
-    assert_eq!(heads.len(), 2, "one request named the version, one did not");
-    assert!(heads[0].contains("\r\nx-github-api-version:"));
-    assert!(!heads[1].contains("\r\nx-github-api-version:"));
+    assert_eq!(status.available, None);
+    assert_eq!(status.announce, None);
 }
 
-/// A `410` to the second request too, a repository taken down say,
-/// fails the check: one more request, never a third.
+/// The file names the version that runs, or an older one, as it does
+/// between a build and its release, or after a release taken back:
+/// nothing is announced, and nothing is offered.
 #[tokio::test]
-async fn a_gone_asks_once_more_and_no_more() {
+async fn an_older_or_the_same_version_announces_nothing() {
+    for (file, running) in [
+        ("v0.1.0", "0.1.1"),
+        ("v0.1.1", "0.1.1"),
+        ("v0.1.0", "0.1.0"),
+    ] {
+        let releases = Releases::start(file).await;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = opened_yesterday(dir.path(), &releases).await;
+        let status = releases.session(&manager, running, NOW).await;
+        assert_eq!(releases.visits(), 1);
+        assert_eq!(status.announce, None, "{file} to {running}");
+        assert_eq!(status.available, None, "{file} to {running}");
+    }
+}
+
+/// The site sends the check to another origin: it does not go. A
+/// redirect is followed only within the site, over HTTPS
+/// (`chain::redirects`).
+#[tokio::test]
+async fn a_redirection_is_not_followed() {
+    let elsewhere = Releases::start("v9.0.0").await;
     let releases = Releases::start("v0.2.0").await;
-    releases.gone(Gone::Every);
+    releases.serve(Answer::Redirect(format!("{}/desktop.json", elsewhere.site)));
     let dir = tempfile::tempdir().unwrap();
     let manager = open(dir.path()).await;
-
     assert!(matches!(
         releases.button(&manager, "0.1.0").await,
         Err(CoreError::Sync { .. })
     ));
-    assert_eq!(releases.heads().len(), 2, "one more request, no third");
+    assert_eq!(elsewhere.visits(), 0);
+    assert_eq!(manager.update_status("0.1.0").await.available, None);
 }
 
-/// The second request comes out of the check's budget, not a new one:
-/// a `410` then a server that says nothing ends at the budget.
+/// A site that says nothing ends at the budget of the check, after its
+/// one request.
 #[tokio::test]
-async fn the_second_request_keeps_to_the_budget() {
+async fn a_silent_site_ends_at_the_budget() {
     let releases = Releases::start("v0.2.0").await;
-    releases.gone(Gone::VersionedAndStall);
+    releases.serve(Answer::Stall);
     let started = std::time::Instant::now();
     let answer = crate::updates::latest_tag_within(
-        &releases.api,
-        REPO,
+        &releases.site,
+        FEED,
         None,
         std::time::Duration::from_millis(800),
     )
     .await;
     assert!(matches!(answer, Err(CoreError::Sync { .. })), "{answer:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
-    assert_eq!(releases.heads().len(), 2);
+    assert_eq!(releases.heads().len(), 1);
 }
 
 /// A clock a year ahead at the first launch, then set right: the first
@@ -533,7 +584,7 @@ async fn a_session_never_starts_the_built_in_tor() {
 #[tokio::test]
 async fn with_an_onion_backend_the_check_goes_through_tor() {
     let releases = Releases::start("v0.1.0").await;
-    let upstream = releases.api.trim_start_matches("http://").to_owned();
+    let upstream = releases.site.trim_start_matches("http://").to_owned();
     let asked: Arc<Mutex<Vec<(String, u16)>>> = Arc::default();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let proxy = listener.local_addr().unwrap().to_string();
@@ -582,7 +633,7 @@ async fn with_an_onion_backend_the_check_goes_through_tor() {
     assert!(manager.uses_tor().await);
 
     let status = manager
-        .check_update_at("http://releases.test", REPO, "0.1.0")
+        .check_update_at("http://releases.test", FEED, "0.1.0")
         .await
         .unwrap();
     assert_eq!(status.available, None);

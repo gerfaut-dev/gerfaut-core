@@ -425,7 +425,7 @@ impl WalletManager {
     /// network's, or the one configured for any other network. It
     /// decides the route of what is not a sync and must not give away
     /// more than one, the update check first: someone who set an onion
-    /// backend anywhere is not someone whose address GitHub should see.
+    /// backend anywhere is not someone whose address the site should see.
     /// For the apps, the reason a check is paused while Tor is down.
     pub async fn uses_tor(&self) -> bool {
         if self.backend_needs_tor().await {
