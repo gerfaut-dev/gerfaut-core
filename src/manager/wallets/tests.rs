@@ -218,6 +218,26 @@ async fn a_watched_address_has_nothing_to_reveal() {
     assert!(listed[0].revealed);
 }
 
+/// The receive page reads its address and the audit list at once, in
+/// either order: the audit list lists the next address without revealing
+/// it, so the receive page still sees one nobody was shown.
+#[tokio::test]
+async fn the_address_list_reveals_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let meta = manager
+        .add_wallet("Signet cold", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    let listed = manager.address_list(&meta.id).await.unwrap();
+    assert_eq!(listed.external[0].index, 0);
+
+    let offered = manager.receive_addresses(&meta.id, 0).await.unwrap();
+    assert_eq!(offered[0].index, 0);
+    assert!(!offered[0].revealed);
+}
+
 #[tokio::test]
 async fn address_list_and_export_read_the_same_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,7 +248,7 @@ async fn address_list_and_export_read_the_same_state() {
         .await
         .unwrap();
 
-    // Fresh wallet: one revealed external address, no change yet.
+    // Fresh wallet: the next external address, no change yet.
     let list = manager.address_list(&meta.id).await.unwrap();
     assert_eq!(list.external.len(), 1);
     assert_eq!(list.external[0].index, 0);

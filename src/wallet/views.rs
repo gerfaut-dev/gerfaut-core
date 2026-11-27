@@ -2,8 +2,8 @@
 //! [`crate::wallet::snapshot`], and into the facts syncs and the live
 //! watch read from it: what the wallet already holds, which scripts to
 //! watch, what moved. No I/O. Two of them change the engine:
-//! `address_list` and `receive_addresses` reveal addresses, a change
-//! set the caller persists.
+//! `receive_addresses` and `reveal_receive_address` reveal addresses, a
+//! change set the caller persists.
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::address::Address;
@@ -902,10 +902,12 @@ pub(crate) fn coins(wallet: &bdk_wallet::Wallet) -> Vec<Coin> {
 pub(crate) const ADDRESS_LIST_CAP: usize = 200;
 
 /// Revealed addresses of both keychains, ascending, with usage and the
-/// balance currently sitting on each. Reveals the next unused external
-/// address when every revealed one is used, the first one included:
-/// the caller must persist the staged change set afterwards.
-pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
+/// balance currently sitting on each. When every revealed external
+/// address is used, the first one included, the next one is listed too,
+/// peeked and not revealed: revealing is the receive page's alone, which
+/// shows that address in full and tells it apart from one shown before
+/// ([`receive_addresses`]). Reveals nothing, so nothing to persist.
+pub(crate) fn address_list(wallet: &bdk_wallet::Wallet) -> AddressList {
     // Balance per (keychain, index) from the unspent set.
     let mut balances: std::collections::HashMap<(KeychainKind, u32), u64> =
         std::collections::HashMap::new();
@@ -914,9 +916,12 @@ pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
             .entry((output.keychain, output.derivation_index))
             .or_default() += output.txout.value.to_sat();
     }
-
-    // Guarantee at least one visible external address.
-    let _ = wallet.next_unused_address(KeychainKind::External);
+    let row = |keychain: KeychainKind, index: u32| AddressRow {
+        index,
+        address: wallet.peek_address(keychain, index).address.to_string(),
+        used: wallet.spk_index().is_used(keychain, index),
+        balance_sats: balances.get(&(keychain, index)).copied().unwrap_or(0),
+    };
 
     let mut truncated = false;
     let mut rows = |keychain: KeychainKind| -> Vec<AddressRow> {
@@ -928,16 +933,23 @@ pub(crate) fn address_list(wallet: &mut bdk_wallet::Wallet) -> AddressList {
             truncated = true;
         }
         (0..count.min(ADDRESS_LIST_CAP) as u32)
-            .map(|index| AddressRow {
-                index,
-                address: wallet.peek_address(keychain, index).address.to_string(),
-                used: wallet.spk_index().is_used(keychain, index),
-                balance_sats: balances.get(&(keychain, index)).copied().unwrap_or(0),
-            })
+            .map(|index| row(keychain, index))
             .collect()
     };
-    let external = rows(KeychainKind::External);
+    let mut external = rows(KeychainKind::External);
     let internal = rows(KeychainKind::Internal);
+
+    // At least one visible external address: the next unused one. A
+    // descriptor with no wildcard has no next one past its first.
+    let wildcard = wallet
+        .public_descriptor(KeychainKind::External)
+        .has_wildcard();
+    if external.len() < ADDRESS_LIST_CAP
+        && external.iter().all(|r| r.used)
+        && (wildcard || external.is_empty())
+    {
+        external.push(row(KeychainKind::External, external.len() as u32));
+    }
     AddressList {
         external,
         internal,
@@ -1320,6 +1332,47 @@ mod tests {
         let entries = receive_addresses(&mut wallet, 3);
         let seen: Vec<(u32, bool)> = entries.iter().map(|e| (e.index, e.revealed)).collect();
         assert_eq!(seen, [(0, true), (2, true), (4, false), (5, false)]);
+    }
+
+    /// The receive page offers the first address nobody paid, shown
+    /// before or not: once a payment to it shows up, still in the
+    /// mempool, it is no longer offered at all.
+    #[test]
+    fn the_address_on_offer_gives_way_to_a_mempool_payment() {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        use bdk_wallet::bitcoin::{
+            Amount, OutPoint, Transaction, TxIn, TxOut, absolute, transaction,
+        };
+
+        let mut wallet = bdk_wallet::Wallet::create(EXTERNAL, INTERNAL)
+            .network(bdk_wallet::bitcoin::Network::Signet)
+            .create_wallet_no_persist()
+            .unwrap();
+        let shown = receive_addresses(&mut wallet, 1);
+        reveal_receive_address(&mut wallet, 1).unwrap();
+        // Shown before, so told apart, but still the one on offer.
+        let again = receive_addresses(&mut wallet, 1);
+        assert_eq!((again[0].index, again[0].revealed), (0, true));
+
+        let payment = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+                ..TxIn::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: wallet
+                    .peek_address(KeychainKind::External, 0)
+                    .script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(payment, 1_700_000_000)]);
+
+        let after = receive_addresses(&mut wallet, 3);
+        assert_eq!((after[0].index, after[0].revealed), (1, true));
+        assert!(after.iter().all(|e| e.address != shown[0].address));
     }
 
     /// A payment is worth two words: when it shows up, and when a block
