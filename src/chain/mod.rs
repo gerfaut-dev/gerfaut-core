@@ -762,6 +762,11 @@ pub(crate) struct Held {
     /// What the wallet holds for each script it revealed, and each
     /// script of the plan.
     pub scripts: HashMap<ScriptBuf, ScriptFacts>,
+    /// Every script the wallet counts as its own: the ones it revealed,
+    /// and the ones past them it looks ahead to. A coin on one of them
+    /// is a coin of the wallet's, and what a transaction spending it
+    /// sends.
+    pub ours: HashSet<ScriptBuf>,
     /// Every output of the graph's transactions and every coin it holds
     /// alone, added up: see [`check_amounts`].
     pub sats: u64,

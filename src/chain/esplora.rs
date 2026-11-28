@@ -24,6 +24,10 @@ pub(crate) const PARALLEL_REQUESTS: usize = 4;
 /// transactions there are, with room to spare. A server that sends more
 /// is not answering the question, and is cut off rather than buffered.
 const MAX_BODY: usize = 32 << 20;
+/// The largest transaction read raw: no transaction weighs more than a
+/// block's 4,000,000 weight units, which no serialization of it
+/// exceeds in bytes.
+const MAX_TX: usize = 4 << 20;
 /// The largest JSON answer read, once decompressed. It is parsed as it
 /// arrives, and what is not kept, the assembly of each script and each
 /// witness, costs nothing: this only stops a server that never ends.
@@ -337,7 +341,7 @@ impl Client {
 
     /// A transaction, `None` when the server does not know it.
     pub(crate) async fn tx(&self, txid: &Txid) -> Result<Option<Transaction>, Fault> {
-        match self.fetch(&format!("/tx/{txid}/raw"), MAX_BODY).await? {
+        match self.fetch(&format!("/tx/{txid}/raw"), MAX_TX).await? {
             Some(bytes) => bdk_wallet::bitcoin::consensus::deserialize(&bytes)
                 .map(Some)
                 .map_err(|_| Fault::other("unexpected response")),
@@ -1121,7 +1125,7 @@ async fn history_round(
         (confirmed_so_far, last, all_held) = read(page, &mut txs)?;
         sent = txs.len();
     }
-    check_spent(&txs[..sent], held)?;
+    check_spent(client, our_script, &txs[..sent], held).await?;
     let times = sync::prove_confirmations(client, network, tip, &claimed).await?;
     let proven: std::collections::HashMap<(String, u32), Option<u64>> = claimed
         .iter()
@@ -1150,56 +1154,117 @@ async fn history_round(
 
 /// Refuses a server that says a coin a transaction it sent this round
 /// (`sent`) spends is other than what the transaction that pays it
-/// pays, when that one is in the round or the wallet holds it
-/// ([`crate::chain::proof::COIN_NOT_PAID`]): what it pays hashes to its
-/// txid, the coin Esplora attaches to an input does not. A coin of the
-/// address is one of them as long as the address has fewer transactions
-/// than a round holds and the server lists the transaction that paid it
-/// in the address's history: what a transaction spends of the address,
-/// and so what it sends, is then the word of the transaction that paid
-/// it, and the server cannot make it more, nor pass off a spend of the
-/// address as one of someone else's. One that leaves that transaction
-/// out, its counters lowered to match, still has its word taken for the
-/// coin, which moves what the transaction shows sent and its fee, never
-/// the balance, read from the coins ([`coins`]). A transaction the
-/// wallet holds is held to what it pays and whether it pays the
-/// address, the address spelled as a release before this one may have
-/// spelled it being left aside. A coin whose transaction is past the
-/// round, or someone else's paid by a transaction the address had no
-/// part in, is the server's word still, and with it the fee and the
-/// facts read of the input: proving it would cost reading that
-/// transaction, a request for each payer's, and for a busy address
-/// whose coins are old, a request for each coin it spends in the first
-/// page, read at every sync.
-fn check_spent(sent: &[AddressTx], held: &[AddressTx]) -> Result<(), Fault> {
-    use std::collections::HashMap;
+/// pays ([`crate::chain::proof::COIN_NOT_PAID`]): what it pays hashes to
+/// its txid, the coin Esplora attaches to an input does not. The
+/// transaction that pays it is the one in the round, or the one the
+/// wallet holds. A transaction the wallet holds is held to what it pays
+/// and whether it pays the address, the address spelled as a release
+/// before this one may have spelled it being left aside.
+///
+/// A coin said to be the address's is the address's only once the
+/// transaction that pays it is in hand: when it is neither in the round
+/// nor held, it is asked for (`/tx/:txid/raw`), and one the server does
+/// not have, or that does not pay the address that much, refuses the
+/// server. So is a coin the wallet holds as the address's that the server
+/// now says is someone else's, or worth another amount: what a
+/// transaction spends of the address, and so what it sends, is the word
+/// of the transaction that paid it. An input of a transaction the wallet
+/// holds, said as the wallet holds it, was proven when the transaction
+/// was new, and is not asked for again: an address of fewer transactions
+/// than a round holds costs nothing more, and a busy one a request for
+/// each coin of its own that a new transaction spends, paid before the
+/// round.
+///
+/// A coin of someone else's paid by a transaction the address had no
+/// part in is the server's word still, and with it the fee and the facts
+/// read of the input: proving it would cost reading that transaction, a
+/// request for each payer's, at every sync.
+async fn check_spent(
+    client: &Client,
+    our_script: &bdk_wallet::bitcoin::ScriptBuf,
+    sent: &[AddressTx],
+    held: &[AddressTx],
+) -> Result<(), Fault> {
+    use std::collections::{BTreeMap, HashMap};
     let read: HashMap<&str, &AddressTx> = sent.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
+    let known: HashMap<&str, &AddressTx> = held.iter().map(|tx| (tx.txid.as_str(), tx)).collect();
     let kept: HashMap<&str, &AddressTx> = held
         .iter()
         .filter(|tx| !tx.outputs.is_empty())
         .map(|tx| (tx.txid.as_str(), tx))
         .collect();
-    for input in sent.iter().flat_map(|tx| &tx.inputs) {
-        let (Some(txid), Some(vout), Some(_)) =
-            (&input.prev_txid, input.prev_vout, input.value_sats)
-        else {
-            continue;
-        };
-        let (paying, fresh) = match (read.get(txid.as_str()), kept.get(txid.as_str())) {
-            (Some(paying), _) => (paying, true),
-            (None, Some(paying)) => (paying, false),
-            (None, None) => continue,
-        };
-        let agrees = paying.outputs.get(vout as usize).is_some_and(|output| {
-            output.value_sats == input.value_sats
-                && output.is_mine == input.is_mine
-                && (!fresh || output.address == input.address)
-        });
-        if !agrees {
-            return Err(Fault::coin_not_paid());
+    let mut unpaid: BTreeMap<Txid, Vec<SaidCoin>> = BTreeMap::new();
+    for tx in sent {
+        for input in &tx.inputs {
+            let (Some(txid), Some(vout), Some(value)) =
+                (&input.prev_txid, input.prev_vout, input.value_sats)
+            else {
+                continue;
+            };
+            let (paying, fresh) = match (read.get(txid.as_str()), kept.get(txid.as_str())) {
+                (Some(paying), _) => (paying, true),
+                (None, Some(paying)) => (paying, false),
+                (None, None) => {
+                    let was = known.get(tx.txid.as_str()).and_then(|held| {
+                        held.inputs.iter().find(|kept| {
+                            kept.prev_txid == input.prev_txid && kept.prev_vout == input.prev_vout
+                        })
+                    });
+                    let proven = was.is_some_and(|kept| {
+                        kept.value_sats == input.value_sats && kept.is_mine == input.is_mine
+                    });
+                    let ours = input.is_mine || was.is_some_and(|kept| kept.is_mine);
+                    if ours && !proven {
+                        let paid: Txid = txid.parse().map_err(|_| Fault::coin_not_paid())?;
+                        unpaid.entry(paid).or_default().push(SaidCoin {
+                            vout,
+                            sats: value,
+                            ours: input.is_mine,
+                        });
+                    }
+                    continue;
+                }
+            };
+            let agrees = paying.outputs.get(vout as usize).is_some_and(|output| {
+                output.value_sats == input.value_sats
+                    && output.is_mine == input.is_mine
+                    && (!fresh || output.address == input.address)
+            });
+            if !agrees {
+                return Err(Fault::coin_not_paid());
+            }
+        }
+    }
+    let unpaid: Vec<(Txid, Vec<SaidCoin>)> = unpaid.into_iter().collect();
+    for batch in unpaid.chunks(PARALLEL_REQUESTS) {
+        let paying =
+            futures_util::future::try_join_all(batch.iter().map(|(txid, _)| client.tx(txid)))
+                .await?;
+        for ((txid, coins), paying) in batch.iter().zip(paying) {
+            let Some(paying) = paying.filter(|tx| tx.compute_txid() == *txid) else {
+                return Err(Fault::coin_not_paid());
+            };
+            let pays = |coin: &SaidCoin| {
+                paying.output.get(coin.vout as usize).is_some_and(|output| {
+                    (output.script_pubkey == *our_script) == coin.ours
+                        && output.value.to_sat() == coin.sats
+                })
+            };
+            if !coins.iter().all(pays) {
+                return Err(Fault::coin_not_paid());
+            }
         }
     }
     Ok(())
+}
+
+/// A coin an input spends, as the server says it is, to read from the
+/// transaction that paid it ([`check_spent`]).
+struct SaidCoin {
+    vout: u32,
+    sats: u64,
+    /// Whether the server says it is the address's.
+    ours: bool,
 }
 
 /// Fills a round read down to a page the wallet holds whole from the
@@ -1803,7 +1868,11 @@ mod error_tests {
         assert_eq!(client.height().await.unwrap_err(), cut);
         assert_eq!(client.tip_hash().await.unwrap_err(), cut);
         let txid: Txid = "01".repeat(32).parse().unwrap();
-        assert_eq!(client.tx(&txid).await.unwrap_err(), cut);
+        // A transaction is cut off sooner: no transaction is larger.
+        assert_eq!(
+            client.tx(&txid).await.unwrap_err(),
+            "the server sent an answer longer than 4 MiB"
+        );
         // JSON is parsed as it arrives: refused at its first bytes.
         let script = ScriptBuf::from_bytes(vec![0x51]);
         assert!(client.scripthash_stats(&script).await.is_err());
