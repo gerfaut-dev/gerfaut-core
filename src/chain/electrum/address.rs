@@ -38,7 +38,7 @@ use electrum_client::{GetMerkleRes, TxidFromPosRes};
 use super::rpc::{CallError, Connection};
 use super::status::{Check, Told, Verdict, scripthash};
 use super::{MAX_LINE, Target};
-use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address, script_address};
+use crate::chain::esplora::{HISTORY_PAGES_PER_ROUND, HistoryRound, parse_address};
 use crate::chain::proof::{
     Proof, ProvenCoin, above_the_tip, chain_to_checkpoint, chained, chains_to_read,
     check_confirmation, checkpoint_for, height, proven_coin, recheck, remember_coin,
@@ -1269,7 +1269,7 @@ fn to_address_tx(
                     }
                     paid_in = paid_in.and_then(|sum| sum.checked_add(value));
                     TxIo {
-                        address: script_address(&prevout.script_pubkey, network),
+                        address: network.address_of(&prevout.script_pubkey),
                         value_sats: Some(value),
                         is_mine,
                         prev_txid: Some(spends.txid.to_string()),
@@ -1292,7 +1292,7 @@ fn to_address_tx(
         .output
         .iter()
         .map(|output| TxIo {
-            address: script_address(&output.script_pubkey, network),
+            address: network.address_of(&output.script_pubkey),
             value_sats: Some(output.value.to_sat()),
             is_mine: output.script_pubkey == *ours,
             change: false,

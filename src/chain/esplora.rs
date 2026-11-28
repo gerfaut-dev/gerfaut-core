@@ -1277,7 +1277,7 @@ fn to_address_tx(
         .iter()
         .map(|vin| match &vin.prevout {
             Some(prevout) => TxIo {
-                address: script_address(&prevout.scriptpubkey, network),
+                address: network.address_of(&prevout.scriptpubkey),
                 value_sats: Some(prevout.value),
                 is_mine: prevout.scriptpubkey == *our_script,
                 prev_txid: Some(vin.txid.to_string()),
@@ -1293,7 +1293,7 @@ fn to_address_tx(
         .vout
         .iter()
         .map(|vout| TxIo {
-            address: script_address(&vout.scriptpubkey, network),
+            address: network.address_of(&vout.scriptpubkey),
             value_sats: Some(vout.value),
             is_mine: vout.scriptpubkey == *our_script,
             change: false,
@@ -1351,15 +1351,6 @@ fn to_address_tx(
         outputs,
         extras: Some(extras),
     }
-}
-
-pub(crate) fn script_address(
-    script: &bdk_wallet::bitcoin::ScriptBuf,
-    network: Network,
-) -> Option<String> {
-    Address::from_script(script, network.to_bitcoin())
-        .ok()
-        .map(|a| a.to_string())
 }
 
 // --- broadcast ------------------------------------------------------------
