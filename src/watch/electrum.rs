@@ -250,7 +250,6 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, target: &Target) -> 
     });
     let proxy = match hub.proxy_for(endpoint).await {
         Ok(proxy) => proxy,
-        Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
         Err(exit) => return exit,
     };
     let budget = hub.connect_budget(endpoint);
