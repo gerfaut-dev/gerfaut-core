@@ -251,16 +251,26 @@ impl Plan {
     }
 }
 
-/// Opens a session with the server at `endpoint`: waits for the round
-/// its pace has in view, if an earlier session left one, then refuses a
-/// server of another network before it hears of any script, from its
-/// genesis block: it would report changes that never happened on the
-/// wallet's.
-pub(super) async fn same_network(
+/// Opens a session with the Esplora server at `endpoint`, through Tor
+/// when it is an onion: the poller that asks it, and the proxy it is
+/// reached through for whoever opens another connection to it.
+pub(super) async fn open(
     hub: &mut Hub,
     endpoint: &Endpoint,
-    poller: &Poller,
-) -> Result<(), Exit> {
+    base: &str,
+) -> Result<(Poller, Option<String>), Exit> {
+    let proxy = hub.proxy_for(endpoint).await?;
+    let poller = Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node())
+        .map_err(Exit::Unreachable)?;
+    same_network(hub, endpoint, &poller).await?;
+    Ok((poller, proxy))
+}
+
+/// Waits for the round the server's pace has in view, if an earlier
+/// session left one, then refuses a server of another network before it
+/// hears of any script, from its genesis block: it would report changes
+/// that never happened on the wallet's.
+async fn same_network(hub: &mut Hub, endpoint: &Endpoint, poller: &Poller) -> Result<(), Exit> {
     let first = hub.pace(endpoint).first_wait(Instant::now());
     rest(hub, first).await?;
     let client = poller.client.clone();
@@ -332,18 +342,10 @@ pub(super) fn apply(hub: &mut Hub, found: Vec<(String, Fingerprint)>) {
 
 pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit {
     let label = endpoint.label();
-    let proxy = match hub.proxy_for(endpoint).await {
-        Ok(proxy) => proxy,
-        Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
+    let poller = match open(hub, endpoint, base).await {
+        Ok((poller, _)) => poller,
         Err(exit) => return exit,
     };
-    let poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
-        Ok(poller) => poller,
-        Err(detail) => return Exit::Unreachable(detail),
-    };
-    if let Err(exit) = same_network(hub, endpoint, &poller).await {
-        return exit;
-    }
     let mut tip: Option<String> = None;
     let mut failed = 0u32;
     let started = Instant::now();

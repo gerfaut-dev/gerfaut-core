@@ -20,9 +20,7 @@ use bdk_wallet::bitcoin::consensus::encode;
 use bdk_wallet::bitcoin::script::Instruction;
 use bdk_wallet::bitcoin::secp256k1::Secp256k1;
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, TapSighashType};
-use bdk_wallet::bitcoin::{
-    Address, OutPoint, Psbt, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Witness,
-};
+use bdk_wallet::bitcoin::{OutPoint, Psbt, Script, Transaction, TxIn, TxOut, Txid, Witness};
 use bdk_wallet::miniscript::psbt::PsbtExt;
 use serde::{Deserialize, Serialize};
 
@@ -903,11 +901,6 @@ pub fn build_preview(
     now_secs: u64,
 ) -> TxPreview {
     let tx = &decoded.tx;
-    let address_of = |script: &ScriptBuf| {
-        Address::from_script(script, network.to_bitcoin())
-            .ok()
-            .map(|a| a.to_string())
-    };
 
     // A coin the PSBT proves, read in the previous transaction its
     // outpoint commits to, is the coin itself: nothing outweighs it,
@@ -937,7 +930,9 @@ pub fn build_preview(
             txid: input.previous_output.txid.to_string(),
             vout: input.previous_output.vout,
             value_sats: prevout.as_ref().map(|p| p.value.to_sat()),
-            address: prevout.as_ref().and_then(|p| address_of(&p.script_pubkey)),
+            address: prevout
+                .as_ref()
+                .and_then(|p| network.address_of(&p.script_pubkey)),
             signed: decoded.inputs[i].signed,
             wallet: input_facts.get(i).and_then(|f| f.wallet.clone()),
         })
@@ -952,7 +947,7 @@ pub fn build_preview(
             TxOutputPreview {
                 index: i as u32,
                 value_sats: output.value.to_sat(),
-                address: address_of(&output.script_pubkey),
+                address: network.address_of(&output.script_pubkey),
                 op_return: op_return_of(&output.script_pubkey),
                 wallet: facts.wallet,
                 change: facts.change,
@@ -1047,7 +1042,8 @@ pub fn build_preview(
         ));
     }
     let place = |prevout: &TxOut| {
-        address_of(&prevout.script_pubkey)
+        network
+            .address_of(&prevout.script_pubkey)
             .unwrap_or_else(|| format!("script {:x}", prevout.script_pubkey))
     };
     for (i, input) in decoded.inputs.iter().enumerate() {
@@ -1490,6 +1486,8 @@ pub fn outpoints(decoded: &DecodedTx) -> Vec<OutPoint> {
 
 #[cfg(test)]
 mod tests {
+    use bdk_wallet::bitcoin::{Address, ScriptBuf};
+
     use super::*;
 
     /// Every kind is named here on purpose: adding one to the enum must

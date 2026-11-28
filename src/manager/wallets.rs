@@ -20,7 +20,7 @@ use crate::wallet::views;
 
 use super::{
     WalletManager, build_record, ensure_engine, find_record, find_record_mut, find_watched,
-    fresh_meta, merge_changeset,
+    fresh_meta, keep_staged,
 };
 
 impl WalletManager {
@@ -51,13 +51,7 @@ impl WalletManager {
             if !parsed.networks.contains(&network) {
                 return Err(super::network_mismatch(network, &parsed.networks));
             }
-            let name = name.trim();
-            if name.is_empty() {
-                return Err(CoreError::InvalidInput {
-                    kind: "wallet name",
-                    detail: "a wallet needs a name".to_owned(),
-                });
-            }
+            let name = clean_name(name)?;
 
             let kind = match &parsed.payload {
                 ParsedPayload::Descriptors {
@@ -96,13 +90,7 @@ impl WalletManager {
     }
 
     pub async fn rename_wallet(&self, id: &str, name: &str) -> CoreResult<()> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(CoreError::InvalidInput {
-                kind: "wallet name",
-                detail: "a wallet needs a name".to_owned(),
-            });
-        }
+        let name = clean_name(name)?;
         self.state.lock().await.commit(|payload| {
             find_record_mut(payload, id)?.meta.name = name.to_owned();
             Ok(())
@@ -337,9 +325,7 @@ impl WalletManager {
                 let engine = ensure_engine(&mut state, id)?;
                 let entries = views::receive_addresses(engine, lookahead);
                 // Revealing may stage a change set; persist it.
-                let staged = engine.take_staged();
-                if let Some(staged) = staged {
-                    merge_changeset(&mut state, id, staged)?;
+                if keep_staged(&mut state, id)? {
                     let state = &mut *state;
                     state.vault.save(&state.payload)?;
                 }
@@ -361,9 +347,7 @@ impl WalletManager {
         if let WalletKind::Descriptors { .. } = &record.meta.kind {
             let engine = ensure_engine(&mut state, id)?;
             views::reveal_receive_address(engine, index)?;
-            let staged = engine.take_staged();
-            if let Some(staged) = staged {
-                merge_changeset(&mut state, id, staged)?;
+            if keep_staged(&mut state, id)? {
                 let state = &mut *state;
                 state.vault.save(&state.payload)?;
             }
@@ -595,6 +579,19 @@ fn without(value: &str, named: &dyn Fn(&str) -> bool) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// The name a wallet is kept under: the one given, without the spaces
+/// around it. A wallet needs one, whether it is added, renamed or restored.
+pub(super) fn clean_name(name: &str) -> CoreResult<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CoreError::InvalidInput {
+            kind: "wallet name",
+            detail: "a wallet needs a name".to_owned(),
+        });
+    }
+    Ok(name)
 }
 
 #[cfg(test)]

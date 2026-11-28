@@ -1029,8 +1029,10 @@ async fn prove_height(
 }
 
 /// The server's tip, proven as a descriptor wallet's sync proves it
-/// ([`checked_latest`]): what a watched address counts its
-/// confirmations from. One request, the one that read the height alone.
+/// ([`checked_latest`]): its latest blocks chain, each with the work of
+/// its height, under any height a chain of `network` can have reached.
+/// What a watched address counts its confirmations from: the height
+/// alone would make each as deep as a server cared to say. One request.
 pub(crate) async fn proven_tip(client: &Client, network: Network) -> Result<u32, Fault> {
     let limit = height_limit(network, crate::now_secs());
     let (latest, _) = latest_blocks(client, network, limit).await?;

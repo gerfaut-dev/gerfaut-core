@@ -472,6 +472,12 @@ pub(crate) fn is_onion(url: &str) -> bool {
     host_of(url).is_some_and(|host| is_onion_host(&host))
 }
 
+/// What a connection that would leave without Tor is refused with when
+/// `host` is a hidden service.
+pub(crate) fn onion_needs_tor(host: &str) -> String {
+    format!("{host} is an onion address and needs Tor")
+}
+
 /// Whether a bare host name is a hidden service, in whatever case it
 /// was spelled, and with or without the trailing dot a fully qualified
 /// name may carry: `x.onion.` names the same service as `x.onion`, and

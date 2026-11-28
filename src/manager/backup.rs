@@ -13,8 +13,9 @@ use crate::input::RecognizedKind;
 use crate::network::Network;
 use crate::now_secs;
 use crate::store::{Settings, VaultPayload, WalletRecord};
-use crate::wallet::meta::WalletKind;
+use crate::wallet::meta::{MAX_GAP_LIMIT, MIN_GAP_LIMIT, WalletKind};
 
+use super::wallets::clean_name;
 use super::{
     WalletManager, check_material, engine_for, find_record, find_watched, fresh_meta, record_with,
 };
@@ -175,7 +176,7 @@ impl WalletManager {
             // Restored wallets take the gap limit in force once the settings
             // are applied.
             let gap_limit = match payload.gap_limit.filter(|_| settings_applied) {
-                Some(gap_limit) => gap_limit.clamp(1, 500),
+                Some(gap_limit) => gap_limit.clamp(MIN_GAP_LIMIT, MAX_GAP_LIMIT),
                 None => state.payload.settings.gap_limit,
             };
 
@@ -455,23 +456,12 @@ fn wallet_called(index: usize, name: &str) -> String {
     }
 }
 
-/// Refuses a wallet without a name, as adding one does.
-fn check_name(name: &str) -> CoreResult<()> {
-    if name.trim().is_empty() {
-        return Err(CoreError::InvalidInput {
-            kind: "wallet name",
-            detail: "a wallet needs a name".to_owned(),
-        });
-    }
-    Ok(())
-}
-
 /// The engine a wallet of the backup is restored with, built the way
 /// adding a wallet builds it ([`engine_for`]), or what it is refused
 /// for: its name, its material in the words of [`check_material`], then
 /// whatever the engine refuses, which has the last word.
 fn restorable(wallet: &BackupWallet) -> CoreResult<Option<bdk_wallet::Wallet>> {
-    check_name(&wallet.name)?;
+    clean_name(&wallet.name)?;
     check_material(&wallet.kind, wallet.network)?;
     engine_for(&wallet.kind, wallet.network)
 }

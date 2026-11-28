@@ -2123,8 +2123,8 @@ impl Hub {
     }
 
     /// The Tor proxy for this endpoint: resolved when it is an onion,
-    /// `None` otherwise. A failure is a lost connection like any other,
-    /// and never a reason to go around Tor.
+    /// `None` otherwise. Without a route the server is out of reach:
+    /// never a reason to go around Tor.
     pub async fn proxy_for(&mut self, endpoint: &Endpoint) -> Result<Option<String>, Exit> {
         if !endpoint.is_onion() {
             return Ok(None);
@@ -2136,7 +2136,7 @@ impl Hub {
             .await?;
         match route {
             Ok(route) => Ok(Some(route.proxy())),
-            Err(error) => Err(Exit::Lost(error.to_string())),
+            Err(error) => Err(Exit::Unreachable(error.to_string())),
         }
     }
 

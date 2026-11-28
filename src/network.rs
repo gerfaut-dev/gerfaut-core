@@ -36,6 +36,14 @@ impl Network {
         }
     }
 
+    /// The address a script pays to on this network, when it has one: a
+    /// bare multisig or an `OP_RETURN` has none.
+    pub(crate) fn address_of(self, script: &bdk_wallet::bitcoin::Script) -> Option<String> {
+        bdk_wallet::bitcoin::Address::from_script(script, self.to_bitcoin())
+            .ok()
+            .map(|address| address.to_string())
+    }
+
     /// Mapping from the `rust-bitcoin` network type.
     ///
     /// Testnet v3 maps to [`Network::Testnet4`]: address and key encodings
@@ -114,6 +122,25 @@ impl std::str::FromStr for Network {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_script_has_the_address_of_its_network_or_none() {
+        use bdk_wallet::bitcoin::ScriptBuf;
+
+        // The P2WPKH program of BIP-173's examples.
+        let script =
+            ScriptBuf::from_hex("0014751e76e8199196d454941c45d1b3a323f1433bd6").expect("script");
+        assert_eq!(
+            Network::Mainnet.address_of(&script).as_deref(),
+            Some("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4")
+        );
+        assert_eq!(
+            Network::Signet.address_of(&script).as_deref(),
+            Some("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")
+        );
+        let data = ScriptBuf::from_hex("6a0568656c6c6f").expect("script");
+        assert_eq!(Network::Mainnet.address_of(&data), None);
+    }
 
     #[test]
     fn bitcoin_roundtrip() {

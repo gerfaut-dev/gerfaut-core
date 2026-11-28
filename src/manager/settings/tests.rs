@@ -11,6 +11,22 @@ use crate::manager::tests::support::{
     BACKUP_PASSWORD, MULTIPATH, closed_port, key, manager, seeded,
 };
 
+/// The refusal names both ends of the range, in the words a user reads.
+#[tokio::test]
+async fn a_gap_limit_out_of_range_is_refused_with_the_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    for outside in [0, 501] {
+        let refusal = manager.set_gap_limit(outside).await.unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "invalid gap limit: must be between 1 and 500"
+        );
+    }
+    manager.set_gap_limit(1).await.unwrap();
+    manager.set_gap_limit(500).await.unwrap();
+}
+
 #[tokio::test]
 async fn gap_limit_is_global_and_persisted() {
     let dir = tempfile::tempdir().unwrap();

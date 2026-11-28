@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{WebSocketStream, client_async_with_config};
 use url::Url;
 
-use super::poll::{self, Poller};
+use super::poll;
 use super::{ChangeReason, Exit, Hub, Wake, WatchState, WatchTransport};
 use crate::chain::Endpoint;
 use crate::chain::net::{self, BoxStream, Security};
@@ -79,18 +79,10 @@ pub(super) async fn run(hub: &mut Hub, endpoint: &Endpoint, base: &str) -> Exit 
         status.transport = Some(WatchTransport::MempoolWebsocket);
         status.server = Some(label.clone());
     });
-    let proxy = match hub.proxy_for(endpoint).await {
-        Ok(proxy) => proxy,
-        Err(Exit::Lost(detail)) => return Exit::Unreachable(detail),
+    let (poller, proxy) = match poll::open(hub, endpoint, base).await {
+        Ok(opened) => opened,
         Err(exit) => return exit,
     };
-    let poller = match Poller::new(base, proxy.as_deref(), hub.config.backend.is_own_node()) {
-        Ok(poller) => poller,
-        Err(detail) => return Exit::Unreachable(detail),
-    };
-    if let Err(exit) = poll::same_network(hub, endpoint, &poller).await {
-        return exit;
-    }
     // Credentials in the address travel as a header, the way the HTTP
     // client of a sync sends them, and not in the request line.
     let authorization = (!url.username().is_empty()).then(|| {

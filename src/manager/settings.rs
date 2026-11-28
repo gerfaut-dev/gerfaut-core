@@ -14,6 +14,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::network::Network;
 use crate::prefs::{Preferences, PreferencesChange};
 use crate::store::Settings;
+use crate::wallet::meta::{MAX_GAP_LIMIT, MIN_GAP_LIMIT};
 
 use super::WalletManager;
 
@@ -291,10 +292,10 @@ impl WalletManager {
     /// narrows future scans (revealed addresses stay watched).
     pub async fn set_gap_limit(&self, gap_limit: u32) -> CoreResult<()> {
         let result: CoreResult<()> = async {
-            if !(1..=500).contains(&gap_limit) {
+            if !(MIN_GAP_LIMIT..=MAX_GAP_LIMIT).contains(&gap_limit) {
                 return Err(CoreError::InvalidInput {
                     kind: "gap limit",
-                    detail: "must be between 1 and 500".to_owned(),
+                    detail: format!("must be between {MIN_GAP_LIMIT} and {MAX_GAP_LIMIT}"),
                 });
             }
             self.state.lock().await.commit(|payload| {

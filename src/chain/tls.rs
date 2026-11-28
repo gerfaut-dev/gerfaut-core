@@ -614,9 +614,7 @@ pub(crate) fn tcp_connect(
     // An onion only ever goes through Tor. Whatever let one get this
     // far, the system resolver never hears its name.
     if crate::chain::is_onion_host(host) {
-        return Err(ConnectError::Io(format!(
-            "{host} is an onion address and needs Tor"
-        )));
+        return Err(ConnectError::Io(crate::chain::onion_needs_tor(host)));
     }
     let addresses = (host, port)
         .to_socket_addrs()

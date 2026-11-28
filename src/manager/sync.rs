@@ -18,7 +18,7 @@ use crate::wallet::{AddressTx, AddressWatchState};
 
 use super::{
     ManagerState, SyncSlot, WalletManager, drop_blocks_above, ensure_engine, find_record,
-    find_record_mut, merge_changeset,
+    find_record_mut, keep_staged,
 };
 
 /// Outcome of syncing every wallet of a workspace.
@@ -787,11 +787,7 @@ fn apply_synced(
     };
     let recheck = views::recheck(engine, &vanishing, read.as_ref());
     let (new_txs, confirmed_txs) = moves.lines();
-    let staged = engine.take_staged();
-
-    if let Some(staged) = staged {
-        merge_changeset(state, &meta.id, staged)?;
-    }
+    keep_staged(state, &meta.id)?;
     let now = now_secs();
     crate::live::news::record(
         &mut state.payload,

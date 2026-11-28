@@ -6,7 +6,6 @@
 //! change set the caller persists.
 
 use bdk_wallet::KeychainKind;
-use bdk_wallet::bitcoin::address::Address;
 use bdk_wallet::bitcoin::{Script, Txid};
 use bdk_wallet::chain::ChainPosition;
 
@@ -49,12 +48,6 @@ fn summary(
         confirmations: depth(&status, tip),
         status,
     }
-}
-
-fn address_of(script: &Script, network: Network) -> Option<String> {
-    Address::from_script(script, network.to_bitcoin())
-        .ok()
-        .map(|a| a.to_string())
 }
 
 // --- descriptor wallets (BDK engine) -----------------------------------
@@ -803,7 +796,7 @@ pub(crate) fn tx_detail(
             // have it draw a transaction that does not exist.
             let outpoint = (!txin.previous_output.is_null()).then_some(txin.previous_output);
             TxIo {
-                address: previous.and_then(|p| address_of(&p.script_pubkey, network)),
+                address: previous.and_then(|p| network.address_of(&p.script_pubkey)),
                 value_sats: previous.map(|p| p.value.to_sat()),
                 is_mine: previous.is_some_and(|p| wallet.is_mine(p.script_pubkey.clone())),
                 prev_txid: outpoint.map(|o| o.txid.to_string()),
@@ -816,7 +809,7 @@ pub(crate) fn tx_detail(
         .output
         .iter()
         .map(|txout| TxIo {
-            address: address_of(&txout.script_pubkey, network),
+            address: network.address_of(&txout.script_pubkey),
             value_sats: Some(txout.value.to_sat()),
             is_mine: wallet.is_mine(txout.script_pubkey.clone()),
             change: matches!(
@@ -859,7 +852,7 @@ pub(crate) fn utxos(wallet: &bdk_wallet::Wallet, network: Network) -> Vec<UtxoIn
             UtxoInfo {
                 txid: output.outpoint.txid.to_string(),
                 vout: output.outpoint.vout,
-                address: address_of(&output.txout.script_pubkey, network),
+                address: network.address_of(&output.txout.script_pubkey),
                 value_sats: output.txout.value.to_sat(),
                 confirmations: depth(&status, tip),
                 status,
