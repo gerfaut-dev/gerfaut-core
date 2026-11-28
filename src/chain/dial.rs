@@ -223,9 +223,7 @@ pub(crate) async fn connect_async(
 ) -> io::Result<tokio::net::TcpStream> {
     // An onion is only ever named to Tor; the caller sends it there.
     if crate::chain::is_onion_host(host) {
-        return Err(io::Error::other(format!(
-            "{host} is an onion address and needs Tor"
-        )));
+        return Err(io::Error::other(crate::chain::onion_needs_tor(host)));
     }
     connect_addresses_async(resolve_async(host, port).await?, timeout).await
 }
@@ -236,9 +234,7 @@ pub(crate) async fn connect_async(
 /// onion, which only Tor may be asked about.
 pub(crate) async fn resolve_async(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     if crate::chain::is_onion_host(host) {
-        return Err(io::Error::other(format!(
-            "{host} is an onion address and needs Tor"
-        )));
+        return Err(io::Error::other(crate::chain::onion_needs_tor(host)));
     }
     Ok(tokio::net::lookup_host((host, port)).await?.collect())
 }
