@@ -356,16 +356,23 @@ pub(crate) fn takes_a_proxy(client: &reqwest::Client) -> bool {
 /// clear, or an onion name to the system's resolver.
 pub(crate) fn redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        let same = attempt
-            .previous()
-            .first()
-            .is_some_and(|first| first.origin() == attempt.url().origin());
-        if same && attempt.url().scheme() == "https" && attempt.previous().len() <= 5 {
+        if follows(attempt.previous(), attempt.url()) {
             attempt.follow()
         } else {
             attempt.stop()
         }
     })
+}
+
+/// Whether a request that went through `previous` (the URLs it asked
+/// so far, the first being the one the client was given) follows a
+/// redirection to `next`: the rule of [`redirects`], apart from the
+/// client that applies it.
+fn follows(previous: &[Url], next: &Url) -> bool {
+    let same = previous
+        .first()
+        .is_some_and(|first| first.origin() == next.origin());
+    same && next.scheme() == "https" && previous.len() <= 5
 }
 
 /// What one sync may keep of the transactions it reads, those the wallet
@@ -2553,5 +2560,85 @@ mod tests {
         // The words are the node's, cut to a line a screen holds.
         let long = node_verdict(&format!("bad-txns-{}", "x".repeat(1 << 20))).unwrap();
         assert_eq!(long.chars().count(), 201);
+    }
+
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
+
+    /// A service that moves a path on its own host is followed.
+    #[test]
+    fn a_redirection_within_the_same_origin_is_followed() {
+        let first = [url("https://esplora.example/api/blocks/tip/height")];
+        assert!(follows(&first, &url("https://esplora.example/v2/tip")));
+        // The default port written out is the same origin.
+        assert!(follows(&first, &url("https://esplora.example:443/v2/tip")));
+        let custom = [url("https://esplora.example:8443/api")];
+        assert!(follows(&custom, &url("https://esplora.example:8443/v2")));
+    }
+
+    /// Another host is another service, whose route was never checked.
+    #[test]
+    fn a_redirection_to_another_host_is_refused() {
+        let first = [url("https://esplora.example/api")];
+        assert!(!follows(&first, &url("https://elsewhere.example/api")));
+        assert!(!follows(&first, &url("https://sub.esplora.example/api")));
+    }
+
+    /// Another port on the same host is another service too.
+    #[test]
+    fn a_redirection_to_another_port_is_refused() {
+        let first = [url("https://esplora.example/api")];
+        assert!(!follows(&first, &url("https://esplora.example:8443/api")));
+        let custom = [url("https://esplora.example:8443/api")];
+        assert!(!follows(&custom, &url("https://esplora.example/api")));
+    }
+
+    /// A step from HTTPS down to HTTP sends the request in the clear.
+    #[test]
+    fn a_redirection_from_https_to_http_is_refused() {
+        let first = [url("https://esplora.example/api")];
+        assert!(!follows(&first, &url("http://esplora.example/api")));
+        assert!(!follows(&first, &url("http://esplora.example:443/api")));
+    }
+
+    /// Even within one origin, a redirection followed only over HTTPS:
+    /// a client given a plain `http` URL does not follow one more.
+    #[test]
+    fn a_redirection_over_plain_http_is_refused() {
+        let first = [url("http://esplora.example/api")];
+        assert!(!follows(&first, &url("http://esplora.example/v2")));
+    }
+
+    /// Later in a chain, a redirection is still held to the origin of the
+    /// URL the client was given, never to that of the step before it.
+    #[test]
+    fn the_origin_is_the_one_the_client_was_given() {
+        let chain = [
+            url("https://esplora.example/api"),
+            url("https://esplora.example/v2"),
+        ];
+        assert!(follows(&chain, &url("https://esplora.example/v3")));
+        assert!(!follows(&chain, &url("https://elsewhere.example/v3")));
+        // Were the step before the one off the origin, its own origin
+        // would still not be the client's.
+        let strayed = [
+            url("https://esplora.example/api"),
+            url("https://elsewhere.example/v2"),
+        ];
+        assert!(!follows(&strayed, &url("https://elsewhere.example/v3")));
+    }
+
+    /// Five redirections are followed, the sixth ends the request.
+    #[test]
+    fn the_sixth_redirection_is_refused() {
+        let hop = |n: usize| url(&format!("https://esplora.example/hop/{n}"));
+        let asked: Vec<Url> = (0..=6).map(hop).collect();
+        // `previous` holds what was asked so far: the redirection to
+        // hop `n` comes after n URLs.
+        for n in 1..=5 {
+            assert!(follows(&asked[..n], &hop(n)), "redirection {n}");
+        }
+        assert!(!follows(&asked[..6], &hop(6)), "redirection 6");
     }
 }
