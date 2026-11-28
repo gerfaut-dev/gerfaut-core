@@ -75,7 +75,8 @@ pub struct UpdateRecord {
     #[serde(default)]
     pub(crate) latest: Option<String>,
     /// The release the notice was last closed on: neither it nor any
-    /// release before it is announced again.
+    /// release before it is announced again, unless an answer names a
+    /// release below it ([`UpdateRecord::answered`]).
     #[serde(default)]
     pub(crate) dismissed: Option<String>,
     /// See [`UpdateStatus::tor_unavailable`].
@@ -166,11 +167,19 @@ impl UpdateRecord {
     }
 
     /// Takes the tag a check answered: the release it names, or nothing
-    /// when it names none.
+    /// when it names none. A release below the one the notice was closed
+    /// on says the later one was taken back: the closing goes with it,
+    /// and the releases after the one named are announced again. An
+    /// answer that names no release leaves the closing as it is.
     pub(crate) fn answered(&mut self, tag: &str) {
-        self.latest = Version::parse(tag)
-            .filter(Version::is_release)
-            .map(|version| version.to_string());
+        let latest = Version::parse(tag).filter(Version::is_release);
+        let closed = self.dismissed.as_deref().and_then(Version::parse);
+        if let (Some(latest), Some(closed)) = (&latest, &closed)
+            && latest < closed
+        {
+            self.dismissed = None;
+        }
+        self.latest = latest.map(|version| version.to_string());
     }
 
     /// Closes the notice on `version`, and so on every release up to it.
@@ -753,6 +762,30 @@ mod tests {
         record.dismiss(&version("0.2.0"));
         assert_eq!(record.dismissed.as_deref(), Some("0.3.0"));
         assert_eq!(record.status("0.1.0").announce, None);
+    }
+
+    /// A release the site named once and then took back does not keep
+    /// the notice closed: the notice closed on 99.0.0, an answer that
+    /// names 0.2.0 announces 0.2.0, and the closing is gone. An answer
+    /// that names the release closed, or no release, keeps it closed.
+    #[test]
+    fn a_release_taken_back_reopens_the_notice_below_it() {
+        let mut record = UpdateRecord::default();
+        record.answered("v99.0.0");
+        record.dismiss(&version("99.0.0"));
+        record.answered("v0.2.0");
+        let status = record.status("0.1.1");
+        assert_eq!(status.available.as_deref(), Some("0.2.0"));
+        assert_eq!(status.announce.as_deref(), Some("0.2.0"));
+        assert_eq!(record.dismissed, None);
+
+        record.dismiss(&version("0.2.0"));
+        record.answered("v0.2.0");
+        assert_eq!(record.status("0.1.1").announce, None);
+        record.answered("not a release");
+        assert_eq!(record.dismissed.as_deref(), Some("0.2.0"));
+        record.answered("v0.3.0");
+        assert_eq!(record.status("0.1.1").announce.as_deref(), Some("0.3.0"));
     }
 
     /// What the vault holds is read as a version or not at all: a value
