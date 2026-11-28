@@ -13,6 +13,11 @@ use crate::wallet::snapshot::BalanceSnapshot;
 /// addresses after which scanning stops.
 pub const DEFAULT_GAP_LIMIT: u32 = 20;
 
+/// The gap limits a user may set: a setting outside them is refused, and a
+/// backup that carries one is brought back inside.
+pub const MIN_GAP_LIMIT: u32 = 1;
+pub const MAX_GAP_LIMIT: u32 = 500;
+
 /// What a wallet is made of.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

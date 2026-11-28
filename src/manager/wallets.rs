@@ -51,13 +51,7 @@ impl WalletManager {
             if !parsed.networks.contains(&network) {
                 return Err(super::network_mismatch(network, &parsed.networks));
             }
-            let name = name.trim();
-            if name.is_empty() {
-                return Err(CoreError::InvalidInput {
-                    kind: "wallet name",
-                    detail: "a wallet needs a name".to_owned(),
-                });
-            }
+            let name = clean_name(name)?;
 
             let kind = match &parsed.payload {
                 ParsedPayload::Descriptors {
@@ -96,13 +90,7 @@ impl WalletManager {
     }
 
     pub async fn rename_wallet(&self, id: &str, name: &str) -> CoreResult<()> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(CoreError::InvalidInput {
-                kind: "wallet name",
-                detail: "a wallet needs a name".to_owned(),
-            });
-        }
+        let name = clean_name(name)?;
         self.state.lock().await.commit(|payload| {
             find_record_mut(payload, id)?.meta.name = name.to_owned();
             Ok(())
@@ -595,6 +583,19 @@ fn without(value: &str, named: &dyn Fn(&str) -> bool) -> Option<String> {
         }
         Err(_) => None,
     }
+}
+
+/// The name a wallet is kept under: the one given, without the spaces
+/// around it. A wallet needs one, whether it is added, renamed or restored.
+pub(super) fn clean_name(name: &str) -> CoreResult<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CoreError::InvalidInput {
+            kind: "wallet name",
+            detail: "a wallet needs a name".to_owned(),
+        });
+    }
+    Ok(name)
 }
 
 #[cfg(test)]

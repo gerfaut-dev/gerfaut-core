@@ -352,6 +352,37 @@ async fn an_address_row_never_overflows() {
     assert_eq!(list.external[0].balance_sats, u64::MAX);
 }
 
+/// A name is kept without the spaces around it, and a wallet is never
+/// left without one, added or renamed.
+#[tokio::test]
+async fn a_name_is_trimmed_and_an_empty_one_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager(dir.path()).await;
+    let parsed = parse_input(MULTIPATH).unwrap();
+    let nameless = manager
+        .add_wallet("   ", &parsed, Network::Signet)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        nameless.to_string(),
+        "invalid wallet name: a wallet needs a name"
+    );
+
+    let meta = manager
+        .add_wallet("  Cold  ", &parsed, Network::Signet)
+        .await
+        .unwrap();
+    assert_eq!(meta.name, "Cold");
+    manager.rename_wallet(&meta.id, " Vault\t").await.unwrap();
+    assert_eq!(manager.list_wallets(None).await[0].name, "Vault");
+    let nameless = manager.rename_wallet(&meta.id, " ").await.unwrap_err();
+    assert_eq!(
+        nameless.to_string(),
+        "invalid wallet name: a wallet needs a name"
+    );
+    assert_eq!(manager.list_wallets(None).await[0].name, "Vault");
+}
+
 #[tokio::test]
 async fn rename_persists() {
     let dir = tempfile::tempdir().unwrap();
