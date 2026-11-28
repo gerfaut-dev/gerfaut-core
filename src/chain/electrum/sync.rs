@@ -134,28 +134,37 @@ pub(crate) fn run(client: &impl ElectrumApi, plan: Plan) -> Result<Synced, Error
             let histories = super::patiently(|| {
                 client.batch_script_get_history(batch.iter().map(|(_, s)| s.as_script()))
             })?;
+            let mut walked = Vec::with_capacity(batch.len());
             for ((index, script), history) in batch.iter().zip(histories) {
+                let history = stood_by(client, told, &held, script, history)?;
+                if let Some(history) = &history {
+                    pass.take(script, history, &chain);
+                }
+                covered.insert(script.clone());
+                walked.push((index, script, history));
+            }
+            // The transactions listed are read now rather than at the end:
+            // whether a script was paid is theirs to say.
+            pass.fetch_missing(client)?;
+            for (index, script, history) in walked {
                 // Set aside, it holds something the wallet holds: it is
                 // used, the scan goes on past it, and the wallet reveals
                 // it.
-                let Some(history) = stood_by(client, told, &held, script, history)? else {
-                    covered.insert(script.clone());
+                let Some(history) = history else {
                     set_aside = true;
                     unused = 0;
                     last_active.insert(keychain, *index);
                     continue;
                 };
-                if history.is_empty() {
+                if pass.paid(script, &history) {
+                    unused = 0;
+                    last_active.insert(keychain, *index);
+                } else {
                     unused = unused.saturating_add(1);
                     if unused >= gap {
                         break 'scan;
                     }
-                } else {
-                    unused = 0;
-                    last_active.insert(keychain, *index);
                 }
-                pass.take(script, &history, &chain);
-                covered.insert(script.clone());
             }
         }
     }
@@ -581,6 +590,28 @@ impl Pass<'_> {
                 }
             }
         }
+    }
+
+    /// Whether a script walked past what the wallet knows was paid: a
+    /// transaction its history lists, held or read and so hashed to its
+    /// txid, pays it, or the wallet already holds a transaction on it. A
+    /// history the server lists is its word alone, and paying a script
+    /// takes knowing it, where the server is only given its hash: a walk
+    /// goes no further than what was paid, and the server learns of no
+    /// more than the gap past the last address paid. The transactions
+    /// listed are to be read first ([`Pass::fetch_missing`]).
+    fn paid(&self, script: &ScriptBuf, history: &[GetHistoryRes]) -> bool {
+        self.held
+            .scripts
+            .get(script)
+            .is_some_and(|facts| !facts.expected.is_empty())
+            || history.iter().any(|entry| {
+                self.held
+                    .txs
+                    .get(&entry.tx_hash)
+                    .or_else(|| self.fetched.get(&entry.tx_hash))
+                    .is_some_and(|tx| tx.output.iter().any(|out| out.script_pubkey == *script))
+            })
     }
 
     /// Asks for the transactions the wallet lacks.

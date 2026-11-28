@@ -1300,6 +1300,94 @@ mod tests {
         }
     }
 
+    /// A walk counts an address used only once a transaction pays it: a
+    /// server that lists, for each of the first 200 addresses, a
+    /// transaction of someone else's that pays none of them has the walk
+    /// stop at the gap, the server hearing of no more. A real payment
+    /// among them is found, and the gap counts from it. The transactions
+    /// listed are asked for once each, as before.
+    #[tokio::test]
+    async fn a_walk_goes_no_further_than_what_was_paid() {
+        use bdk_wallet::KeychainKind;
+        use bdk_wallet::bitcoin::constants::genesis_block;
+        use bdk_wallet::chain::{BlockId, CheckPoint};
+
+        use crate::testkit::{FakeElectrum, nowhere, script, scripthash, transaction};
+        fn walked(i: u32) -> String {
+            format!("0014{i:04x}{}", "cd".repeat(18))
+        }
+        const GAP: u32 = 20;
+        for paid_at in [None, Some(5u32)] {
+            let server = FakeElectrum::start().await;
+            let paid_by = |label: u8, to: &str, sats: u64| {
+                let parent = transaction(&[nowhere(label, 0)], &[(&script(8), sats + 1_000)]);
+                let tx = transaction(&[OutPoint::new(parent.compute_txid(), 0)], &[(to, sats)]);
+                server.add_tx(&parent);
+                server.add_tx(&tx);
+                tx
+            };
+            let stranger = paid_by(3, &script(9), 5_000);
+            let payment = paid_by(4, &walked(5), 1_000);
+            for index in 0..200u32 {
+                let mut history = vec![(stranger.compute_txid(), 0)];
+                if Some(index) == paid_at {
+                    history.push((payment.compute_txid(), 0));
+                }
+                server.set_history(&walked(index), &history);
+            }
+            let genesis = genesis_block(bdk_wallet::bitcoin::Network::Signet).block_hash();
+            let spks = (0u32..).map(|i| (i, ScriptBuf::from_hex(&walked(i)).unwrap()));
+            let plan = crate::chain::Plan {
+                network: crate::network::Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: 0,
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: KeychainKind::External,
+                    spks: Box::new(spks),
+                }],
+                stop_gap: GAP,
+                reading: crate::chain::Reading::Complete,
+                held: crate::chain::Held::default(),
+                told: None,
+            };
+            let target = Target::new(format!("tcp://{}", server.address), None);
+            let synced = sync(&target, plan, None, Duration::from_secs(60))
+                .await
+                .unwrap();
+            assert_eq!(
+                synced
+                    .update
+                    .last_active_indices
+                    .get(&KeychainKind::External),
+                paid_at.as_ref()
+            );
+            let index_of: std::collections::HashMap<String, u32> =
+                (0..1000).map(|i| (scripthash(&walked(i)), i)).collect();
+            let state = server.state.lock().unwrap();
+            let asked: Vec<u32> = state
+                .calls
+                .iter()
+                .filter(|(method, _)| method == "blockchain.scripthash.get_history")
+                .map(|(_, hash)| index_of[hash])
+                .collect();
+            let heard = paid_at.map_or(0, |at| at + 1) + GAP;
+            assert_eq!(asked, (0..heard).collect::<Vec<_>>(), "{paid_at:?}");
+            let fetched: Vec<&String> = state
+                .calls
+                .iter()
+                .filter(|(method, _)| method == "blockchain.transaction.get")
+                .map(|(_, txid)| txid)
+                .collect();
+            let once: std::collections::HashSet<&&String> = fetched.iter().collect();
+            assert_eq!(once.len(), fetched.len(), "{fetched:?}");
+            assert!(once.contains(&&stranger.compute_txid().to_string()));
+        }
+    }
+
     fn out_of_memory() -> electrum_client::Error {
         electrum_client::Error::Protocol(serde_json::json!({
             "code": 2, "message": "response budget exhausted, retry later",

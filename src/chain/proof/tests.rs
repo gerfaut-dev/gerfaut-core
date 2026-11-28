@@ -2697,6 +2697,161 @@ mod servers {
         }
     }
 
+    /// A transaction of someone else's, confirmed, that pays 40,000 sats
+    /// to another script and spends a coin said to be one million sats on
+    /// `said`, paid by a transaction no history lists: what the coin is
+    /// does not count in the txid.
+    fn spending_unlisted(said: &str) -> serde_json::Value {
+        let mut tx = crate::testkit::esplora_payment_to(&script(9), 0x7a, 0x7b, 40_000, true);
+        let txid = page_tx(&tx);
+        tx["vin"][0]["prevout"] = serde_json::json!({ "scriptpubkey": said, "value": 1_000_000 });
+        assert_eq!(page_tx(&tx), txid);
+        tx
+    }
+
+    /// Serves `listed` raw, though no history lists it.
+    fn serve_raw(server: &FakeMempool, listed: &serde_json::Value) {
+        let tx: crate::chain::esplora::page::PageTx =
+            serde_json::from_value(listed.clone()).unwrap();
+        let raw = bdk_wallet::bitcoin::consensus::encode::serialize(&tx.to_tx());
+        server
+            .state
+            .lock()
+            .unwrap()
+            .raw
+            .insert(page_tx(listed).to_string(), raw);
+    }
+
+    /// A coin a descriptor wallet's sync is told is the wallet's counts
+    /// only as the transaction that paid it pays it: one that no history
+    /// lists is asked for, and a server that does not have it refuses the
+    /// sync, on a script the sync read or one the wallet looks ahead to.
+    /// An honest server that lists the spend alone has its payer asked
+    /// for, once, and what the wallet sent is what that payer paid; one
+    /// that lists both is asked for nothing more.
+    #[tokio::test]
+    async fn a_coin_of_the_wallet_s_is_what_the_transaction_that_paid_it_pays() {
+        let ours = ADDRESS_SCRIPT;
+        let server = mempool(Network::Signet).await;
+        list(&server, vec![spending_unlisted(ours)]);
+        let refused =
+            refusal(esplora_sync(&server, address_plan(Network::Signet, Held::default())).await);
+        assert!(
+            refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+            "{refused}"
+        );
+        // A script past the ones walked, that the wallet looks ahead to.
+        let ahead = script(4);
+        list(&server, vec![spending_unlisted(&ahead)]);
+        let held = Held {
+            ours: [ScriptBuf::from_hex(&ahead).unwrap()].into(),
+            ..Held::default()
+        };
+        let refused = refusal(esplora_sync(&server, address_plan(Network::Signet, held)).await);
+        assert!(
+            refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+            "{refused}"
+        );
+        // Someone else's coin is the server's word still.
+        list(&server, vec![spending_unlisted(&script(5))]);
+        esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        assert_eq!(asked(&server, "/raw"), 2);
+
+        let server = mempool(Network::Signet).await;
+        let parent = esplora_payment(0x51, 0x61, 50_000, true);
+        let child = spending(0x51, 50_000, ours);
+        list(&server, vec![child.clone(), parent.clone()]);
+        esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        assert_eq!(asked(&server, "/raw"), 0, "both listed: nothing more asked");
+        list(&server, vec![child.clone()]);
+        serve_raw(&server, &parent);
+        let synced = esplora_sync(&server, address_plan(Network::Signet, Held::default()))
+            .await
+            .unwrap();
+        assert_eq!(asked(&server, "/raw"), 1);
+        let mut wallet = bdk_wallet::Wallet::create_single(
+            "wpkh(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
+        )
+        .network(Network::Signet.to_bitcoin())
+        .create_wallet_no_persist()
+        .unwrap();
+        wallet.apply_update(synced.update).unwrap();
+        let spend = wallet
+            .get_tx(page_tx(&child))
+            .expect("the spend is the wallet's")
+            .tx_node
+            .tx;
+        assert_eq!(
+            wallet.sent_and_received(&spend),
+            (
+                bdk_wallet::bitcoin::Amount::from_sat(50_000),
+                bdk_wallet::bitcoin::Amount::from_sat(40_000)
+            )
+        );
+    }
+
+    /// The same for a watched address, as it is read and as older
+    /// transactions are loaded: a coin said to be the address's whose
+    /// transaction the round does not hold is asked for, refused when the
+    /// server does not have it, read from it when it does; a round that
+    /// lists that transaction asks for nothing more.
+    #[tokio::test]
+    async fn a_coin_of_the_address_is_what_the_transaction_that_paid_it_pays() {
+        let ours = ADDRESS_SCRIPT;
+        let server = mempool(Network::Signet).await;
+        server.state.lock().unwrap().address_txs = vec![spending_unlisted(ours)];
+        let refused = esplora_address(&server, Network::Signet).await.unwrap_err();
+        assert!(
+            refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+            "{refused}"
+        );
+        // Older transactions, past the one the list ends at.
+        let newest = esplora_payment(0x54, 0x64, 30_000, true);
+        server.state.lock().unwrap().address_txs = vec![newest.clone(), spending_unlisted(ours)];
+        let refused = crate::chain::esplora::fetch_address_history(
+            &esplora(&server),
+            SIGNET_ADDRESS,
+            Network::Signet,
+            &page_tx(&newest).to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+            "{refused}"
+        );
+
+        let server = mempool(Network::Signet).await;
+        let parent = esplora_payment(0x53, 0x63, 50_000, true);
+        let child = spending(0x53, 50_000, ours);
+        server.state.lock().unwrap().address_txs = vec![child.clone(), parent.clone()];
+        esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(asked(&server, "/raw"), 0, "both listed: nothing more asked");
+        server.state.lock().unwrap().address_txs = vec![child];
+        serve_raw(&server, &parent);
+        let state = esplora_address(&server, Network::Signet).await.unwrap();
+        assert_eq!(asked(&server, "/raw"), 1);
+        assert_eq!(
+            (state.txs[0].net_sats, state.txs[0].fee_sats),
+            (-10_000, Some(10_000))
+        );
+        // Held as it was read, it is not asked for again.
+        let held = state.txs.clone();
+        crate::chain::esplora::fetch_address_state(
+            &esplora(&server),
+            SIGNET_ADDRESS,
+            Network::Signet,
+            &held,
+        )
+        .await
+        .unwrap();
+        assert_eq!(asked(&server, "/raw"), 1);
+    }
+
     /// The txid of a transaction as Esplora lists it.
     fn page_tx(listed: &serde_json::Value) -> Txid {
         let tx: crate::chain::esplora::page::PageTx =

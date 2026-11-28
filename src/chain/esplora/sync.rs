@@ -159,8 +159,26 @@ struct Read {
     /// Transactions the wallet expected there that the server no longer
     /// lists.
     evicted: Vec<Txid>,
-    /// Whether the script has any history at all, read or not.
-    used: bool,
+}
+
+/// Whether a script walked past what the wallet knows was paid: a
+/// transaction listed for it, which hashes to its txid, pays it, or the
+/// wallet already holds a transaction on it. A history the server lists,
+/// or counters it gives, are its word alone, and paying a script takes
+/// knowing it, where the server is only given its hash: a walk goes no
+/// further than what was paid, and the server learns of no more than the
+/// gap past the last address paid.
+fn paid(script: &ScriptBuf, read: &Read, held: &Held) -> bool {
+    held.scripts
+        .get(script)
+        .is_some_and(|facts| !facts.expected.is_empty())
+        || read.txs.iter().any(|listed| {
+            let tx = match &listed.whole {
+                Some((tx, _)) => Some(tx),
+                None => held.txs.get(&listed.txid).map(|tx| tx.as_ref()),
+            };
+            tx.is_some_and(|tx| tx.output.iter().any(|out| out.script_pubkey == *script))
+        })
 }
 
 /// Runs a plan against one instance.
@@ -255,12 +273,12 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
                 reads.push(read_scanned(client, script, &held, meeting.height));
                 covered.insert(script.clone());
             }
-            for ((index, _), read) in batch.iter().zip(try_join_all(reads).await?) {
-                if !read.used {
-                    unused = unused.saturating_add(1);
-                } else {
+            for ((index, script), read) in batch.iter().zip(try_join_all(reads).await?) {
+                if paid(script, &read, &held) {
                     unused = 0;
                     last_active.insert(keychain, *index);
+                } else {
+                    unused = unused.saturating_add(1);
                 }
                 found.take(read)?;
             }
@@ -290,7 +308,7 @@ pub(crate) async fn run(client: &Client, plan: Plan) -> Result<Synced, Fault> {
     }
 
     let mut update = found.update;
-    check_spent(&held, &update)?;
+    check_spent(client, &held, &covered, &update).await?;
     prove(client, network, server_tip, &held, start_time, &mut update).await?;
     let chain = meeting.chain(&latest, &update.anchors)?;
     Ok(Synced {
@@ -328,7 +346,6 @@ async fn read_script(
     agreed_up_to: u32,
 ) -> Result<Read, Fault> {
     let stats: ScriptHashStats = client.get_json(&script_path(script)).await?;
-    let used = stats.chain_stats.tx_count > 0 || stats.mempool_stats.tx_count > 0;
     let facts = held.scripts.get(script).cloned().unwrap_or_default();
     let reorganised = facts.confirmed.iter().any(|txid| {
         held.anchors
@@ -337,10 +354,7 @@ async fn read_script(
     });
     if Counts::of(&stats) == facts.counts && !reorganised {
         if reading == Reading::Checked || stats.mempool_stats.tx_count == 0 {
-            return Ok(Read {
-                used,
-                ..Read::default()
-            });
+            return Ok(Read::default());
         }
         let path = format!("{}/txs/mempool", script_path(script));
         let txs = listed(client, client.get_page(&path).await?, held)?;
@@ -348,7 +362,6 @@ async fn read_script(
         let mut read = Read {
             txs,
             evicted: Vec::new(),
-            used,
         };
         read.evicted = evicted(&read, &facts, &stats, listed_mempool, false);
         return Ok(read);
@@ -356,7 +369,6 @@ async fn read_script(
     let (mut read, listed_mempool, whole) =
         read_pages_down_to(client, script, held, Some((&facts, &stats))).await?;
     read.evicted = evicted(&read, &facts, &stats, listed_mempool, whole);
-    read.used |= used;
     Ok(read)
 }
 
@@ -427,7 +439,6 @@ async fn read_pages_down_to(
     }
     Ok((
         Read {
-            used: !txs.is_empty(),
             txs,
             evicted: Vec::new(),
         },
@@ -498,43 +509,80 @@ fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashSt
 }
 
 /// Refuses a server that says a coin a new transaction spends is other
-/// than what the transaction that pays it pays, when the wallet holds
-/// that transaction or this sync read it ([`COIN_NOT_PAID`]): those
-/// hash to their txids, the coins Esplora attaches to each input do
-/// not. A coin of the wallet's is one of them once the history of its
-/// script is read, as long as the server lists there the transaction
-/// that paid it: what a transaction spends of the wallet, and so what it
-/// sends, is then the transaction's word and not the server's. A server
-/// that leaves that transaction out of the history, its counters
-/// lowered to match, still has its word taken for the coin, which moves
-/// what the transaction shows sent, never the balance, made of the
-/// wallet's own outputs. The coins of others whose transaction neither
-/// holds are the server's word still, as they are for a watched
-/// address: they make the fee shown, and the facts read of an input.
-/// Reading each of their transactions would prove them: a request for
-/// each payer's transaction, a third more requests for the first sync of
-/// a wallet of twenty addresses paid twice each (122 requests, measured
-/// against a server of the tests), 42 per cent more for one of a hundred
-/// addresses paid five times each (1,202), as much again for each other
-/// coin a payer spends, and every byte of those transactions, for
-/// figures that do not move the balance.
-fn check_spent(held: &Held, update: &TxUpdate<ConfirmationBlockTime>) -> Result<(), Fault> {
+/// than what the transaction that pays it pays ([`COIN_NOT_PAID`]):
+/// transactions hash to their txids, the coins Esplora attaches to each
+/// input do not. The transaction that pays it is the one the wallet
+/// holds or this sync read.
+///
+/// A coin said to be the wallet's, on a script the wallet counts as its
+/// own or this sync read, is the wallet's only once the transaction that pays it is
+/// in hand: when neither holds it, it is asked for (`/tx/:txid/raw`), and
+/// one the server does not have, or that does not pay the coin, refuses
+/// the server. What a transaction spends of the wallet, and so what it
+/// sends, is always the word of the transaction that paid it, never the
+/// server's. An honest server lists that transaction in the history of
+/// the script it pays, which the sync reads: it is asked for only when it
+/// came in after that history was read.
+///
+/// The coins of others whose transaction neither holds are the server's
+/// word still, as they are for a watched address: they make the fee
+/// shown, and the facts read of an input. Reading each of their
+/// transactions would prove them: a request for each payer's
+/// transaction, a third more requests for the first sync of a wallet of
+/// twenty addresses paid twice each (122 requests, measured against a
+/// server of the tests), 42 per cent more for one of a hundred addresses
+/// paid five times each (1,202), as much again for each other coin a
+/// payer spends, and every byte of those transactions, for figures that
+/// do not move the balance.
+async fn check_spent(
+    client: &Client,
+    held: &Held,
+    covered: &HashSet<ScriptBuf>,
+    update: &TxUpdate<ConfirmationBlockTime>,
+) -> Result<(), Fault> {
     let read: HashMap<Txid, &Transaction> = update
         .txs
         .iter()
         .map(|tx| (tx.compute_txid(), tx.as_ref()))
         .collect();
+    let mut unpaid: BTreeMap<Txid, Vec<(u32, &TxOut)>> = BTreeMap::new();
     for (outpoint, said) in &update.txouts {
         let paying = held
             .txs
             .get(&outpoint.txid)
             .map(|tx| tx.as_ref())
             .or_else(|| read.get(&outpoint.txid).copied());
-        let Some(paying) = paying else {
-            continue;
-        };
-        if paying.output.get(outpoint.vout as usize) != Some(said) {
-            return Err(Fault::coin_not_paid());
+        match paying {
+            Some(paying) => {
+                if paying.output.get(outpoint.vout as usize) != Some(said) {
+                    return Err(Fault::coin_not_paid());
+                }
+            }
+            None if covered.contains(&said.script_pubkey)
+                || held.ours.contains(&said.script_pubkey)
+                || held.scripts.contains_key(&said.script_pubkey) =>
+            {
+                unpaid
+                    .entry(outpoint.txid)
+                    .or_default()
+                    .push((outpoint.vout, said));
+            }
+            None => {}
+        }
+    }
+    let unpaid: Vec<(Txid, Vec<(u32, &TxOut)>)> = unpaid.into_iter().collect();
+    for batch in unpaid.chunks(PARALLEL_REQUESTS) {
+        let paying = try_join_all(batch.iter().map(|(txid, _)| client.tx(txid))).await?;
+        for ((txid, coins), paying) in batch.iter().zip(paying) {
+            let Some(paying) = paying.filter(|tx| tx.compute_txid() == *txid) else {
+                return Err(Fault::coin_not_paid());
+            };
+            if coins
+                .iter()
+                .any(|(vout, said)| paying.output.get(*vout as usize) != Some(*said))
+            {
+                return Err(Fault::coin_not_paid());
+            }
         }
     }
     Ok(())
@@ -1467,6 +1515,105 @@ mod tests {
             heard.sort_unstable();
             heard.dedup();
             assert_eq!(heard, (0..stop_gap).collect::<Vec<_>>(), "gap {stop_gap}");
+        }
+    }
+
+    /// A walk counts an address used only once a transaction pays it: a
+    /// server that lists, for each of the first 200 addresses of a fresh
+    /// keychain, a transaction of someone else's that pays none of them
+    /// has the wallet reveal none, and hears of the gap and no more. A
+    /// real payment among them is found, and the gap counts from it.
+    #[tokio::test]
+    async fn a_walk_goes_no_further_than_what_was_paid() {
+        use crate::testkit::FakeMempool;
+        use bdk_wallet::KeychainKind;
+        use bdk_wallet::chain::SpkIterator;
+        const EXTERNAL: &str = "wpkh(tpubDDnGNapGEY6AZAdQbfRJgMg9fvz8pUBrLwvyvUqEgcUfgzM6zc2eVK4vY9x9L5FJWdX8WumXuLEDV5zDZnTfbn87vLe9XceCFwTu9so9Kks/0/*)";
+        const GAP: u32 = 20;
+        for paid_at in [None, Some(5u32)] {
+            let mut wallet = bdk_wallet::Wallet::create_single(EXTERNAL)
+                .network(bdk_wallet::bitcoin::Network::Signet)
+                .create_wallet_no_persist()
+                .unwrap();
+            let server = FakeMempool::start(false, 0).await;
+            let stranger = crate::testkit::esplora_payment_to(
+                &format!("0014{}", "ab".repeat(20)),
+                0x7c,
+                0x7d,
+                40_000,
+                false,
+            );
+            let mut index_of = HashMap::new();
+            {
+                let mut state = server.state.lock().unwrap();
+                state.tip = 600;
+                state.genesis = Some(bdk_wallet::bitcoin::Network::Signet);
+                for index in 0..200u32 {
+                    let script = wallet
+                        .peek_address(KeychainKind::External, index)
+                        .address
+                        .script_pubkey()
+                        .to_hex_string();
+                    let key = FakeMempool::rest_key(&script);
+                    index_of.insert(key.clone(), index);
+                    let history = if Some(index) == paid_at {
+                        vec![
+                            stranger.clone(),
+                            crate::testkit::esplora_payment_to(&script, 0x7e, 0x7f, 1_000, false),
+                        ]
+                    } else {
+                        vec![stranger.clone()]
+                    };
+                    state.scripts.insert(key, history);
+                }
+            }
+            let client =
+                super::super::client_for_run(&format!("http://{}/api", server.address), None)
+                    .unwrap();
+            let genesis =
+                bdk_wallet::bitcoin::constants::genesis_block(bdk_wallet::bitcoin::Network::Signet)
+                    .block_hash();
+            let descriptor = wallet.public_descriptor(KeychainKind::External).clone();
+            let plan = Plan {
+                network: Network::Signet,
+                tip: CheckPoint::new(BlockId {
+                    height: 0,
+                    hash: genesis,
+                }),
+                start_time: crate::now_secs(),
+                scripts: Vec::new(),
+                scans: vec![crate::chain::Scan {
+                    keychain: KeychainKind::External,
+                    spks: Box::new(SpkIterator::new(descriptor)),
+                }],
+                stop_gap: GAP,
+                reading: Reading::Complete,
+                held: Held::default(),
+                told: None,
+            };
+            let synced = run(&client, plan).await.unwrap();
+            assert_eq!(
+                synced
+                    .update
+                    .last_active_indices
+                    .get(&KeychainKind::External),
+                paid_at.as_ref()
+            );
+            let mut heard: Vec<u32> = server
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .iter()
+                .filter_map(|path| path.split_once("/scripthash/"))
+                .map(|(_, rest)| index_of[rest.split('/').next().unwrap()])
+                .collect();
+            heard.sort_unstable();
+            heard.dedup();
+            let walked = paid_at.map_or(0, |at| at + 1) + GAP;
+            assert_eq!(heard, (0..walked).collect::<Vec<_>>(), "{paid_at:?}");
+            wallet.apply_update(synced.update).unwrap();
+            assert_eq!(wallet.derivation_index(KeychainKind::External), paid_at);
         }
     }
 }

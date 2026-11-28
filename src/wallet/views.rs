@@ -474,6 +474,13 @@ pub(crate) fn held(
             .floating_txouts()
             .map(|(outpoint, _)| outpoint)
             .collect(),
+        ours: wallet
+            .spk_index()
+            .inner()
+            .all_spks()
+            .values()
+            .cloned()
+            .collect(),
         ..Held::default()
     };
     held.sats = held
