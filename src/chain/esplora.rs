@@ -741,7 +741,7 @@ pub(crate) async fn fetch_address_state(
     let our_script = address.script_pubkey();
     check_network(client, network).await?;
 
-    let tip_height = read_tip(client, network).await?;
+    let tip_height = sync::proven_tip(client, network).await?;
     let stats = client.address_stats(&address).await?;
 
     let round = history_round(
@@ -955,7 +955,7 @@ pub(crate) async fn fetch_address_history(
         .parse()
         .map_err(|_| format!("invalid history cursor: {from}"))?;
     check_network(client, network).await?;
-    let tip = read_tip(client, network).await?;
+    let tip = sync::proven_tip(client, network).await?;
     history_round(
         client,
         &address,
@@ -967,15 +967,6 @@ pub(crate) async fn fetch_address_history(
         &[],
     )
     .await
-}
-
-/// The server's tip, proven as a descriptor wallet's is: its latest
-/// blocks chain, each with the work of its height, under any height a
-/// chain of `network` can have reached ([`sync::proven_tip`]). It once
-/// was the height alone, which made every confirmation as deep as a
-/// server cared to say.
-async fn read_tip(client: &Client, network: Network) -> Result<u32, Fault> {
-    sync::proven_tip(client, network).await
 }
 
 /// Refuses a server whose genesis block is not the network's. Testnet,
