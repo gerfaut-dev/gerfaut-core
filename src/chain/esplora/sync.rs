@@ -519,8 +519,7 @@ fn enough(txs: &[Listed], facts: &ScriptFacts, held: &Held, stats: &ScriptHashSt
 /// in hand: when neither holds it, it is asked for (`/tx/:txid/raw`), and
 /// one the server does not have, or that does not pay the coin, refuses
 /// the server. What a transaction spends of the wallet, and so what it
-/// sends, is always the word of the transaction that paid it, never the
-/// server's. An honest server lists that transaction in the history of
+/// sends, is the word of the transaction that paid it. An honest server lists that transaction in the history of
 /// the script it pays, which the sync reads: it is asked for only when it
 /// came in after that history was read.
 ///

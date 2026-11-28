@@ -2831,7 +2831,7 @@ mod servers {
         server.state.lock().unwrap().address_txs = vec![child.clone(), parent.clone()];
         esplora_address(&server, Network::Signet).await.unwrap();
         assert_eq!(asked(&server, "/raw"), 0, "both listed: nothing more asked");
-        server.state.lock().unwrap().address_txs = vec![child];
+        server.state.lock().unwrap().address_txs = vec![child.clone()];
         serve_raw(&server, &parent);
         let state = esplora_address(&server, Network::Signet).await.unwrap();
         assert_eq!(asked(&server, "/raw"), 1);
@@ -2850,6 +2850,24 @@ mod servers {
         .await
         .unwrap();
         assert_eq!(asked(&server, "/raw"), 1);
+        // The same coin, held as the address's, said to be someone else's:
+        // read from the transaction that paid it, which says otherwise.
+        let mut renamed = child.clone();
+        renamed["vin"][0]["prevout"]["scriptpubkey"] = serde_json::json!(script(9));
+        server.state.lock().unwrap().address_txs = vec![renamed];
+        let refused = crate::chain::esplora::fetch_address_state(
+            &esplora(&server),
+            SIGNET_ADDRESS,
+            Network::Signet,
+            &held,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.is_false_proof() && refused.contains(COIN_NOT_PAID),
+            "{refused}"
+        );
+        assert_eq!(asked(&server, "/raw"), 2);
     }
 
     /// The txid of a transaction as Esplora lists it.
