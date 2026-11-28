@@ -20,7 +20,7 @@ use crate::wallet::views;
 
 use super::{
     WalletManager, build_record, ensure_engine, find_record, find_record_mut, find_watched,
-    fresh_meta, merge_changeset,
+    fresh_meta, keep_staged,
 };
 
 impl WalletManager {
@@ -325,9 +325,7 @@ impl WalletManager {
                 let engine = ensure_engine(&mut state, id)?;
                 let entries = views::receive_addresses(engine, lookahead);
                 // Revealing may stage a change set; persist it.
-                let staged = engine.take_staged();
-                if let Some(staged) = staged {
-                    merge_changeset(&mut state, id, staged)?;
+                if keep_staged(&mut state, id)? {
                     let state = &mut *state;
                     state.vault.save(&state.payload)?;
                 }
@@ -349,9 +347,7 @@ impl WalletManager {
         if let WalletKind::Descriptors { .. } = &record.meta.kind {
             let engine = ensure_engine(&mut state, id)?;
             views::reveal_receive_address(engine, index)?;
-            let staged = engine.take_staged();
-            if let Some(staged) = staged {
-                merge_changeset(&mut state, id, staged)?;
+            if keep_staged(&mut state, id)? {
                 let state = &mut *state;
                 state.vault.save(&state.payload)?;
             }

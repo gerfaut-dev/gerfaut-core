@@ -515,6 +515,20 @@ fn merge_changeset(
     Ok(())
 }
 
+/// Moves what a wallet's loaded engine staged into its stored change set,
+/// and tells whether there was anything to move. The vault is not saved
+/// here: the caller saves once its own change is whole.
+fn keep_staged(state: &mut ManagerState, id: &str) -> CoreResult<bool> {
+    let staged = state
+        .engines
+        .get_mut(id)
+        .and_then(|engine| engine.take_staged());
+    match staged {
+        Some(staged) => merge_changeset(state, id, staged).map(|()| true),
+        None => Ok(false),
+    }
+}
+
 /// Takes every block above `height` out of a wallet's chain: blocks a
 /// lying server put there, which no update can take out, since none
 /// will ever hold a block at their height (see
@@ -532,9 +546,7 @@ fn drop_blocks_above(state: &mut ManagerState, id: &str, height: u32) -> CoreRes
     if above.is_empty() {
         return Ok(());
     }
-    if let Some(staged) = engine.take_staged() {
-        merge_changeset(state, id, staged)?;
-    }
+    keep_staged(state, id)?;
     let mut dropped = bdk_wallet::ChangeSet::default();
     dropped.local_chain.blocks = above;
     merge_changeset(state, id, dropped)?;
@@ -561,9 +573,7 @@ pub(crate) fn store_block(
             ..Default::default()
         })
         .map_err(|e| CoreError::Internal(e.to_string()))?;
-    if let Some(staged) = engine.take_staged() {
-        merge_changeset(state, id, staged)?;
-    }
+    keep_staged(state, id)?;
     state.engines.remove(id);
     Ok(())
 }
